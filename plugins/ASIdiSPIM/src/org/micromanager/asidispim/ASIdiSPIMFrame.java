@@ -78,6 +78,7 @@ import org.micromanager.utils.MMFrame;
 //TODO save/load plugin settings from file instead of from registry (nice to also include controller settings)
 //TODO improve efficiency of camera code by pre-calculating key factors and updating when needed instead of calculating every time
 //TODO add check for correct Hamamatsu model
+//TODO fix slightly incorrect Hamamatsu timing calculation (apparent at small ROI)
 //TODO execute autofocus during acquisition before the desired time point is reached instead of waiting until a timepoint should be collected
 //       or else do autofocus after acquisition instead of before
 //TODO smart default joystick settings (e.g. different defaults different panels/wheels)
@@ -85,7 +86,7 @@ import org.micromanager.utils.MMFrame;
 //TODO Make it easier to adjust stack center (or start and end) including autodetect start/end based on content
 //TODO allow different stack center, number of slices, offset, or other settings for each XY position
 //TODO iconify tab labels and/or other parts of plugin
-
+//TODO use new J *=0 to more efficiently clear joystick settings (require comm card version 3.1)
 
 /**
  *
@@ -119,6 +120,7 @@ public class ASIdiSPIMFrame extends MMFrame
    private final StagePositionUpdater stagePosUpdater_;
    private final ListeningJTabbedPane tabbedPane_;
    private PiezoSleepPreventer piezoSleepPreventer_;
+   private final LiveModeListener piezoSleepListener_;
    
    private final AtomicBoolean hardwareInUse_ = new AtomicBoolean(false);   // true if acquisition or autofocus running
    
@@ -142,13 +144,8 @@ public class ASIdiSPIMFrame extends MMFrame
       cameras_ = new Cameras(gui_, devices_, props_, prefs_);
       controller_ = new ControllerUtils(gui_, props_, prefs_, devices_, positions_);
       
-      // make sure Live mode is turned off (panels assume it can manipulate
-      //   cameras which requires live mode to be turned off)
-      boolean liveModeOriginally = gui_.isLiveModeOn();
-      String cameraOriginal = gui_.getMMCore().getCameraDevice();
-      if (liveModeOriginally) {
-         gui_.enableLiveMode(false);
-      }
+      // make sure Live mode is turned off
+      gui_.enableLiveMode(false);
       
       // create the panels themselves
       // in some cases dependencies create required ordering
@@ -160,21 +157,20 @@ public class ASIdiSPIMFrame extends MMFrame
       
       acquisitionPanel_ = new AcquisitionPanel(gui_, devices_, props_, cameras_, 
             prefs_, stagePosUpdater_, positions_, controller_, autofocus_);
-      // TODO change default single path for oSPIM to be path A
+      setupPanelA_ = new SetupPanel(gui_, devices_, props_, joystick_,
+            Devices.Sides.A, positions_, cameras_, prefs_, stagePosUpdater_,
+            autofocus_);
       if (!ASIdiSPIM.oSPIM) {
-         setupPanelA_ = new SetupPanel(gui_, devices_, props_, joystick_, 
-               Devices.Sides.A, positions_, cameras_, prefs_, stagePosUpdater_,
+         setupPanelB_ = new SetupPanel(gui_, devices_, props_, joystick_,
+               Devices.Sides.B, positions_, cameras_, prefs_, stagePosUpdater_,
                autofocus_);
       } else {
-         setupPanelA_ = null;
+         setupPanelB_ = null;
       }
-      setupPanelB_ = new SetupPanel(gui_, devices_, props_, joystick_,
-            Devices.Sides.B, positions_, cameras_, prefs_, stagePosUpdater_,
-            autofocus_);
       navigationPanel_ = new NavigationPanel(gui_, devices_, props_, joystick_,
             positions_, prefs_, cameras_, stagePosUpdater_);
 
-      dataAnalysisPanel_ = new DataAnalysisPanel(gui_, prefs_);
+      dataAnalysisPanel_ = new DataAnalysisPanel(prefs_, props_, devices_);
       autofocusPanel_ = new AutofocusPanel(gui_, devices_, props_, prefs_, autofocus_);
       settingsPanel_ = new SettingsPanel(gui_, devices_, props_, prefs_, stagePosUpdater_);
       stagePosUpdater_.oneTimeUpdate();  // needed for NavigationPanel
@@ -191,10 +187,10 @@ public class ASIdiSPIMFrame extends MMFrame
          tabbedPane_.setTabPlacement(JTabbedPane.LEFT);
       }
       tabbedPane_.addLTab(navigationPanel_);  // tabIndex = 0
+      tabbedPane_.addLTab(setupPanelA_);      // tabIndex = 1
       if (!ASIdiSPIM.oSPIM) {
-         tabbedPane_.addLTab(setupPanelA_);      // tabIndex = 1
+         tabbedPane_.addLTab(setupPanelB_);      // tabIndex = 2
       }
-      tabbedPane_.addLTab(setupPanelB_);      // tabIndex = 2
       tabbedPane_.addLTab(acquisitionPanel_); // tabIndex = 3
       tabbedPane_.addLTab(dataAnalysisPanel_);// tabIndex = 4
       tabbedPane_.addLTab(devicesPanel_);     // tabIndex = 5
@@ -219,22 +215,17 @@ public class ASIdiSPIMFrame extends MMFrame
       // tabbedPane_.addLTab(testingPanel);
 
       // attach position updaters
+      stagePosUpdater_.addPanel(setupPanelA_);
       if (!ASIdiSPIM.oSPIM) {
-         stagePosUpdater_.addPanel(setupPanelA_);
+         stagePosUpdater_.addPanel(setupPanelB_);
       }
-      stagePosUpdater_.addPanel(setupPanelB_);
       stagePosUpdater_.addPanel(navigationPanel_);
       stagePosUpdater_.addPanel(statusSubPanel_);
       
       piezoSleepPreventer_ = new PiezoSleepPreventer(gui_, devices_, props_);
 
       // attach live mode listeners
-      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) setupPanelB_);
-      if (!ASIdiSPIM.oSPIM) {
-         MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) setupPanelA_);
-      }
-      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) navigationPanel_);
-      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener(new LiveModeListener() {
+      piezoSleepListener_ = new LiveModeListener() {
          // make sure to "wake up" any piezos with autosleep enabled before we start imaging 
          @Override
          public void liveModeEnabled(boolean enabled) {
@@ -244,7 +235,13 @@ public class ASIdiSPIMFrame extends MMFrame
                piezoSleepPreventer_.stop();
             }
          }
-      });
+      };
+      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener(piezoSleepListener_);
+      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) setupPanelA_);
+      if (!ASIdiSPIM.oSPIM) {
+         MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) setupPanelB_);
+      }
+      MMStudio.getInstance().getSnapLiveManager().addLiveModeListener((LiveModeListener) navigationPanel_);
       
       // set scan for live mode to be triangle (now live mode setting not affected by SPIM setting)
       props_.setPropValue(new Devices.Keys[]{Devices.Keys.GALVOA, Devices.Keys.GALVOB},
@@ -289,15 +286,6 @@ public class ASIdiSPIMFrame extends MMFrame
             "[" + this.getHeight() + "]"));
       glassPane.add(statusSubPanel_, "dock south");
       
-      // restore live mode and camera
-      if (liveModeOriginally) {
-         gui_.enableLiveMode(true);
-      }
-      try {
-         gui_.getMMCore().setCameraDevice(cameraOriginal);
-      } catch (Exception ex) {
-         // do nothing
-      }
    }
    
    public void setHardwareInUse(boolean inuse) {
@@ -332,6 +320,16 @@ public class ASIdiSPIMFrame extends MMFrame
    }
    
    /**
+    * For use of data analysis panel code (running deskew)
+    * Do not get into the internals of this plugin without relying on
+    * ASIdiSPIM.api
+    * @return the currently used instance of the DataAnalysisPanel;
+    */
+   public DataAnalysisPanel getDataAnalysisPanel() {
+      return dataAnalysisPanel_;
+   }   
+   
+   /**
     * For use by the acquisition panel code (to update offset setting)
     * Do not get into the internals of this plugin without relying on
     * ASIdiSPIM.api
@@ -356,7 +354,7 @@ public class ASIdiSPIMFrame extends MMFrame
    public AutofocusPanel getAutofocusPanel() {
       return autofocusPanel_;
    }
-
+   
    /**
     * Do not get into the internals of this plugin without relying on
     * ASIdiSPIM.api
@@ -376,6 +374,9 @@ public class ASIdiSPIMFrame extends MMFrame
    @Override
    public void propertyChangedAlert(String device, String property, String value) {
      // props_.callListeners();
+     // if (device.equals("Core") && property.equals("Camera")) {
+     //    could call cameras_.setCamera() here
+     //}
    }
 
    @Override
@@ -410,10 +411,10 @@ public class ASIdiSPIMFrame extends MMFrame
    private void saveSettings() {
       // save selections as needed
       devices_.saveSettings();
+      setupPanelA_.saveSettings();
       if (!ASIdiSPIM.oSPIM) {
-         setupPanelA_.saveSettings();
+         setupPanelB_.saveSettings();
       }
-      setupPanelB_.saveSettings();
       navigationPanel_.saveSettings();
       acquisitionPanel_.saveSettings();
       settingsPanel_.saveSettings();
@@ -426,17 +427,22 @@ public class ASIdiSPIMFrame extends MMFrame
    private void windowClosing() {
       // TODO force user to cancel any ongoing acquisition before closing
       acquisitionPanel_.windowClosing();
+      setupPanelA_.windowClosing();
       if (!ASIdiSPIM.oSPIM) {
-         setupPanelA_.windowClosing();
+         setupPanelB_.windowClosing();
       }
-      setupPanelB_.windowClosing();
    }
    
    @Override
    public void dispose() {
       stagePosUpdater_.stop();
+      piezoSleepPreventer_.stop();
       saveSettings();
       windowClosing();
+      MMStudio.getInstance().getSnapLiveManager().removeLiveModeListener(piezoSleepListener_);
+      MMStudio.getInstance().getSnapLiveManager().removeLiveModeListener((LiveModeListener) setupPanelA_);
+      MMStudio.getInstance().getSnapLiveManager().removeLiveModeListener((LiveModeListener) setupPanelB_);
+      MMStudio.getInstance().getSnapLiveManager().removeLiveModeListener((LiveModeListener) navigationPanel_);
       super.dispose();
    }
 }

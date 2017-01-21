@@ -22,10 +22,6 @@
 // BASED ON:      ASIStage.cpp and others
 //
 
-#ifdef WIN32
-#define snprintf _snprintf 
-#pragma warning(disable: 4355)
-#endif
 
 #include "ASIXYStage.h"
 #include "ASITiger.h"
@@ -109,11 +105,11 @@ int CXYStage::Initialize()
    CreateProperty(MM::g_Keyword_Description, command.str().c_str(), MM::String, true);
 
    // max motor speed - read only property
-   double maxSpeedX = getMaxSpeed(axisLetterX_, hub_);
+   double maxSpeedX = getMaxSpeed(axisLetterX_);
    command.str("");
    command << maxSpeedX;
    CreateProperty(g_MaxMotorSpeedXPropertyName, command.str().c_str(), MM::Float, true);
-   double maxSpeedY = getMaxSpeed(axisLetterY_, hub_);
+   double maxSpeedY = getMaxSpeed(axisLetterY_);
    command.str("");
    command << maxSpeedY;
    CreateProperty(g_MaxMotorSpeedYPropertyName, command.str().c_str(), MM::Float, true);
@@ -360,8 +356,15 @@ int CXYStage::Initialize()
 
       pAct = new CPropertyAction (this, &CXYStage::OnScanSettlingTime);
       CreateProperty(g_ScanSettlingTimePropertyName, "1", MM::Float, false, pAct);
-      SetPropertyLimits(g_ScanSettlingTimePropertyName, 0., 500.);  // limits are arbitrary really, just give a reasonable range
+      SetPropertyLimits(g_ScanSettlingTimePropertyName, 0., 5000.);  // limits are arbitrary really, just give a reasonable range
       UpdateProperty(g_ScanSettlingTimePropertyName);
+
+      if (FirmwareVersionAtLeast(3.17)) {
+         pAct = new CPropertyAction (this, &CXYStage::OnScanOvershootDistance);
+         CreateProperty(g_ScanOvershootDistancePropertyName, "0", MM::Integer, false, pAct);  // on controller it is float but <1um precision isn't important and easier to deal with integer
+         SetPropertyLimits(g_ScanOvershootDistancePropertyName, 0, 500);  // limits are arbitrary really, just give a reasonable range
+         UpdateProperty(g_ScanOvershootDistancePropertyName);
+      }
 
    }
 
@@ -369,7 +372,7 @@ int CXYStage::Initialize()
    return DEVICE_OK;
 }
 
-double CXYStage::getMaxSpeed(string axisLetter, ASIHub *hub_)
+double CXYStage::getMaxSpeed(string axisLetter)
 {
    double maxSpeed;
    ostringstream command;
@@ -1806,6 +1809,29 @@ int CXYStage::OnScanSettlingTime(MM::PropertyBase* pProp, MM::ActionType eAct)
    else if (eAct == MM::AfterSet) {
       pProp->Get(tmp);
       command << addressChar_ << "NV F=" << tmp;
+      RETURN_ON_MM_ERROR ( hub_->QueryCommandVerify(command.str(), ":A") );
+   }
+   return DEVICE_OK;
+}
+
+int CXYStage::OnScanOvershootDistance(MM::PropertyBase* pProp, MM::ActionType eAct)
+// note ASI units are in millimeters but MM units are in micrometers
+{
+   ostringstream command; command.str("");
+   double tmp = 0;  // represent as integer in um, but controller gives as float in mm
+   if (eAct == MM::BeforeGet)
+   {
+      if (!refreshProps_ && initialized_)
+         return DEVICE_OK;
+      command << addressChar_ << "NV T?";
+      RETURN_ON_MM_ERROR( hub_->QueryCommandVerify(command.str(), ":A T="));
+      RETURN_ON_MM_ERROR( hub_->ParseAnswerAfterEquals(tmp) );
+      if (!pProp->Set(1000*tmp+0.5))  // convert to um, then round to nearest by adding 0.5 before implicit floor operation
+         return DEVICE_INVALID_PROPERTY_VALUE;
+   }
+   else if (eAct == MM::AfterSet) {
+      pProp->Get(tmp);
+      command << addressChar_ << "NV T=" << tmp/1000;
       RETURN_ON_MM_ERROR ( hub_->QueryCommandVerify(command.str(), ":A") );
    }
    return DEVICE_OK;

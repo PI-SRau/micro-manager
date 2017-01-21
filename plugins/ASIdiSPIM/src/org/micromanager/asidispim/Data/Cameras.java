@@ -133,6 +133,25 @@ public class Cameras {
       return noduplicates.toArray(new CameraData[0]);
    }
 
+   private void setShutterForCamera(Devices.Keys camera) {
+      Devices.Keys shutter = null;
+      if (camera == Devices.Keys.CAMERAA
+            || camera == Devices.Keys.CAMERAB
+            || camera == Devices.Keys.MULTICAMERA) {
+         shutter = Devices.Keys.PLOGIC;
+      }
+      if (camera == Devices.Keys.CAMERALOWER) {
+         shutter = Devices.Keys.SHUTTERLOWER;
+      }
+      if (shutter != null) {
+         try {
+            gui_.getMMCore().setShutterDevice(devices_.getMMDevice(shutter));
+         } catch (Exception ex) {
+            // do nothing
+         }
+      }  
+   }
+   
    /**
     * Switches the active camera to the desired one. Takes care of possible side
     * effects.
@@ -146,15 +165,16 @@ public class Cameras {
       String mmDevice = devices_.getMMDevice(key);
       if (mmDevice != null) {
          try {
-            boolean liveEnabled = gui_.isLiveModeOn();
+            final boolean liveEnabled = gui_.isLiveModeOn();
             if (liveEnabled) {
-               enableLiveMode(false);
+               gui_.enableLiveMode(false);
             }
             currentCameraKey_ = key;
             core_.setCameraDevice(mmDevice);
+            setShutterForCamera(key);
             gui_.refreshGUIFromCache();
             if (liveEnabled) {
-               enableLiveMode(true);
+               gui_.enableLiveMode(true);
             }
          } catch (Exception ex) {
             MyDialogUtils.showError("Failed to set Core Camera property");
@@ -192,17 +212,6 @@ public class Cameras {
     */
    public boolean isCurrentCameraValid() {
       return !((currentCameraKey_ == null) || (currentCameraKey_ == Devices.Keys.NONE));
-   }
-
-   /**
-    * Turns live mode on or off via core call
-    * @param enable true: switch on live mode, false: switch it off
-    */
-   public void enableLiveMode(boolean enable) {
-      if (enable) {
-         setSPIMCamerasForAcquisition(false);
-      }
-      gui_.enableLiveMode(enable);
    }
 
    /**
@@ -296,6 +305,21 @@ public class Cameras {
             break;
          }
          break;
+      case PVCAM:
+         switch (mode) {
+         case EDGE:
+            props_.setPropValue(devKey,
+                  Properties.Keys.TRIGGER_MODE,
+                  Properties.Values.EDGE_TRIGGER, true);
+            break;
+         case INTERNAL:
+            props_.setPropValue(devKey,
+                  Properties.Keys.TRIGGER_MODE,
+                  Properties.Values.INTERNAL_TRIGGER, true);
+            break;
+         default:
+            break;
+         }
       case DEMOCAM:
          // do nothing
          break;
@@ -387,9 +411,8 @@ public class Cameras {
    }
    
    /**
-    * @return dimension/resolution of sensor with binning accounted for
-    *          (i.e. return value will change if binning changes).
-    *          Origin (rectangle's "x" and "y") is always (0, 0).
+    * @return dimension/resolution of sensor.  If binning is enabled then it is
+    *         not reflected here because reset/readout time don't depend on binning.
     */
    private Rectangle getSensorSize(Devices.Keys camKey) {
       int x = 0;
@@ -417,6 +440,10 @@ public class Cameras {
             y = 2048;
          }
          break;
+      case PVCAM:
+         x = props_.getPropValueInteger(camKey, Properties.Keys.CAMERA_X_DIMENSION);
+         y = props_.getPropValueInteger(camKey, Properties.Keys.CAMERA_Y_DIMENSION);
+         break;
       case DEMOCAM:
          x = props_.getPropValueInteger(camKey, Properties.Keys.CAMERA_SIZE_X);
          y = props_.getPropValueInteger(camKey, Properties.Keys.CAMERA_SIZE_Y);
@@ -424,13 +451,12 @@ public class Cameras {
       default:
          break;
       }
-      int binningFactor = getBinningFactor(camKey);
       if (x==0 || y==0){
          MyDialogUtils.showError(
                "Was not able to get sensor size of camera " 
                      + devices_.getMMDevice(camKey));
       }
-      return new Rectangle(0, 0, x/binningFactor, y/binningFactor);
+      return new Rectangle(0, 0, x, y);
    }
    
    /**
@@ -476,6 +502,9 @@ public class Cameras {
                return (2592 * 2 / 540e3);
             }
          }
+      case PVCAM:
+         // TODO get this correct; currently just draft for testing
+         return 20e-3;
       case DEMOCAM:
          return(10e-3);  // dummy 10us row time
       default:
@@ -518,6 +547,11 @@ public class Cameras {
          resetTimeMs = camReadoutTime + (float) (numRowsOverhead * rowReadoutTime);
          break;
       case ANDORCAM:
+         numRowsOverhead = 1;
+         resetTimeMs = camReadoutTime + (float) (numRowsOverhead * rowReadoutTime);
+         break;
+      case PVCAM:
+         // TODO get this correct; currently just draft for testing
          numRowsOverhead = 1;
          resetTimeMs = camReadoutTime + (float) (numRowsOverhead * rowReadoutTime);
          break;
@@ -584,6 +618,11 @@ public class Cameras {
             numReadoutRows = roiReadoutRowsSplitReadout(roi, sensorSize);
             readoutTimeMs = ((float) (numReadoutRows * rowReadoutTime));
             break;
+         case PVCAM:
+            // TODO get this correct; currently just draft for testing
+            numReadoutRows = roi.height;
+            readoutTimeMs = ((float) (numReadoutRows * rowReadoutTime));
+            break;
          case DEMOCAM:
             numReadoutRows = roiReadoutRowsSplitReadout(roi, sensorSize);
             readoutTimeMs = ((float) (numReadoutRows * rowReadoutTime));
@@ -599,54 +638,48 @@ public class Cameras {
    }
    
    /**
-    * private utility/shortcut function to set both SPIM cameras
-    * @param trigMode
+    * Sets the specified camera for acquisition if acq is true or for live mode if acq is false
+    * @param camKey
+    * @param acq
     */
-   private void setSPIMTriggerMode(CameraModes.Keys trigMode) {
-      // TODO look at whether both sides are active before setting cameras up
-      setCameraTriggerMode(Devices.Keys.CAMERAA, trigMode);
-      setCameraTriggerMode(Devices.Keys.CAMERAB, trigMode);
-   }
-
-   /**
-    * Sets up SPIM cameras in correct mode for acquisition when called with true.
-    * Uses the camera mode setting to see which external trigger mode.
-    * @param acq true if setting for acquisition, false if setting for live
-    */
-   public void setSPIMCamerasForAcquisition(boolean acq) {
+   public void setCameraForAcquisition(Devices.Keys camKey, boolean acq) {
       if (acq) {
          CameraModes.Keys cameraMode = CameraModes.getKeyFromPrefCode(
                // could also get from props_ with PLUGIN device
                prefs_.getInt(MyStrings.PanelNames.SETTINGS.toString(),
                      Properties.Keys.PLUGIN_CAMERA_MODE, 0));
-         setSPIMTriggerMode(cameraMode);
+         setCameraTriggerMode(camKey, cameraMode);
          // exposure time set by acquisition setup code
       } else { // for Live mode
-         setSPIMTriggerMode(CameraModes.Keys.INTERNAL);
-         // also set exposure time to the live mode value
-         float exposure = prefs_.getFloat(MyStrings.PanelNames.SETTINGS.toString(),
-               Properties.Keys.PLUGIN_CAMERA_LIVE_EXPOSURE.toString(), 100f);
-         try {
-            core_.setExposure(exposure);
-         } catch (Exception e) {
-            MyDialogUtils.showError("Could not change exposure setting for live mode");
-         }
+         setCameraTriggerMode(camKey, CameraModes.Keys.INTERNAL);
       }
    }
-   
+
    /**
-    * Gets the camera ROI
+    * Gets the camera ROI in actual pixels used (i.e. if binning is 4x with 2k sensor return 2k instead of 512).
+    * This is because reset and readout times depend on actual pixels and only data transfer time (usually less
+    * then readout time) is affected by binning (at least for Flash4v2 CameraLink and Zyla 4.2 CameraLink)
     * @param camKey
     * @return
     */
    public Rectangle getCameraROI(Devices.Keys camKey) {
       Rectangle roi = new Rectangle();
+      int binning;
       try {
          roi = core_.getROI(devices_.getMMDevice(camKey));
+         binning = getBinningFactor(camKey);
+         if (binning > 1) {
+        	 return new Rectangle(
+        			 (roi.x < 0 ? 0 : roi.x*binning),  // make sure isn't negative, some cameras seem to do this
+        			 (roi.y < 0 ? 0 : roi.y*binning),  // make sure isn't negative, some cameras seem to do this
+        			 roi.width*binning, roi.height*binning);
+         } else {
+        	 return roi;
+         }
       } catch (Exception e) {
          MyDialogUtils.showError(e);
       }
-      return roi;
+      return roi;  // only should reach here if there was exception
    }
    
 

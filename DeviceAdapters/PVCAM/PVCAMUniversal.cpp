@@ -62,8 +62,8 @@ using namespace std;
 //#define DEBUG_METHOD_NAMES
 
 #ifdef DEBUG_METHOD_NAMES
-#define START_METHOD(name)              LogMessage(name);
-#define START_ONPROPERTY(name,action)   LogMessage(string(name)+(action==MM::AfterSet?"(AfterSet)":"(BeforeGet)"));
+#define START_METHOD(name)              LogAdapterMessage(name);
+#define START_ONPROPERTY(name,action)   LogAdapterMessage(string(name)+(action==MM::AfterSet?"(AfterSet)":"(BeforeGet)"));
 #else
 #define START_METHOD(name)              
 #define START_ONPROPERTY(name,action)   
@@ -212,9 +212,8 @@ Universal::Universal(short cameraId) :
     hPVCAM_(0),
     cameraId_(cameraId),
     cameraModel_(PvCameraModel_Generic),
-    circBufSizeAuto_(true),
     circBufFrameCount_(CIRC_BUF_FRAME_CNT_DEF), // Sizes larger than 3 caused image tearing in ICX-674. Reason unknown.
-    circBufFrameRecoveryEnabled_(true),
+    circBufFrameRecoveryEnabled_(false),
     stopOnOverflow_(true),
     snappingSingleFrame_(false),
     singleFrameModeReady_(false),
@@ -222,10 +221,10 @@ Universal::Universal(short cameraId) :
     isAcquiring_(false),
     triggerTimeout_(10),
     microsecResSupported_(false),
+    microsecResMax_(1000000), // Will run in usec for up to 1 second
     pollingThd_(0),
     notificationThd_(0),
     acqThd_(0),
-    exposure_(10),
     prmTemp_(0),
     prmTempSetpoint_(0),
     prmGainIndex_(0),
@@ -245,10 +244,6 @@ Universal::Universal(short cameraId) :
     singleFrameBufRawSz_(0),
     rgbImgBuf_(0),
     eofEvent_(false, false),
-#ifdef PVCAM_SMART_STREAMING_SUPPORTED
-    smartStreamEntries_(4),
-    ssWasOn_(false),
-#endif
 #ifdef PVCAM_FRAME_INFO_SUPPORTED
     pFrameInfo_(0),
 #endif
@@ -259,11 +254,13 @@ Universal::Universal(short cameraId) :
     prmTriggerMode_(0),
     prmExpResIndex_(0),
     prmExpRes_(0),
+    prmExposureTime_(0),
     prmExposeOutMode_(0),
     prmClearCycles_(0),
     prmReadoutPort_(0),
     prmColorMode_(0),
     prmFrameBufSize_(0),
+    prmRoiCount_(0),
     prmMetadataEnabled_(0),
     prmCentroidsEnabled_(0),
     prmCentroidsRadius_(0),
@@ -285,6 +282,7 @@ Universal::Universal(short cameraId) :
     SetErrorText(ERR_BINNING_INVALID, "Binning value is not valid for current configuration");
     SetErrorText(ERR_OPERATION_TIMED_OUT, "The operation has timed out");
     SetErrorText(ERR_FRAME_READOUT_FAILED, "Frame readout failed");
+    SetErrorText(ERR_TOO_MANY_ROIS, "Too many ROIs"); // Later overwritten by more specific message
 
     pollingThd_ = new PollingThread(this);             // Pointer to the sequencing thread
 
@@ -335,12 +333,14 @@ Universal::~Universal()
     delete prmBinningPar_;
     delete prmExpResIndex_;
     delete prmExpRes_;
+    delete prmExposureTime_;
     delete prmTriggerMode_;
     delete prmExposeOutMode_;
     delete prmClearCycles_;
     delete prmReadoutPort_;
     delete prmColorMode_;
     delete prmFrameBufSize_;
+    delete prmRoiCount_;
     delete prmMetadataEnabled_;
     delete prmCentroidsEnabled_;
     delete prmCentroidsRadius_;
@@ -378,14 +378,15 @@ int Universal::Initialize()
 
     if (!PVCAM_initialized_)
     {
-        LogMessage("PVCAM: Initializing PVCAM");
+        LogAdapterMessage("Initializing PVCAM");
         if (!pl_pvcam_init())
         {
-            LogCamError(__LINE__, "First PVCAM init failed");
+            LogPvcamError(__LINE__, "First PVCAM init failed");
             // Try once more:
-            pl_pvcam_uninit();
+            if (!pl_pvcam_uninit())
+                LogPvcamError(__LINE__, "PVCAM uninit failed");
             if (!pl_pvcam_init())
-                return LogCamError(__LINE__, "Second PVCAM init failed");
+                return LogPvcamError(__LINE__, "Second PVCAM init failed");
         }
         PVCAM_initialized_ = true;
 
@@ -399,7 +400,7 @@ int Universal::Initialize()
     }
     else
     {
-        LogMessage("PVCAM: PVCAM already initialized");
+        LogAdapterMessage("PVCAM already initialized");
     }
 
     // gather information about the camera
@@ -408,11 +409,11 @@ int Universal::Initialize()
     // Get PVCAM version
     uns16 version;
     if (!pl_pvcam_get_ver(&version))
-        return LogCamError(__LINE__, "pl_pvcam_get_ver() FAILED");
+        return LogPvcamError(__LINE__, "pl_pvcam_get_ver() FAILED");
 
     int16 numCameras;
     if (!pl_cam_get_total(&numCameras))
-        return LogCamError(__LINE__, "pl_cam_get_total() FAILED");
+        return LogPvcamError(__LINE__, "pl_cam_get_total() FAILED");
 
     uns16 major = (version >> 8) & 0xFF;
     uns16 minor = (version >> 4) & 0xF;
@@ -422,39 +423,39 @@ int Universal::Initialize()
     ver << major << "." << minor << "." << trivial;
     nRet = CreateProperty("PVCAM Version", ver.str().c_str(), MM::String, true);
     ver << ". Number of cameras detected: " << numCameras;
-    LogMessage("PVCAM: PVCAM version: " + ver.str());
+    LogAdapterMessage("PVCAM version: " + ver.str());
     assert(nRet == DEVICE_OK);
 
     stringstream verAdapter;
     verAdapter << PVCAM_ADAPTER_VERSION_MAJOR << "." << PVCAM_ADAPTER_VERSION_MINOR << "." << PVCAM_ADAPTER_VERSION_REVISION;
     nRet = CreateProperty("PVCAM Adapter Version", verAdapter.str().c_str(), MM::String, true);
-    LogMessage("PVCAM: PVCAM Adapter version: " + verAdapter.str());
+    LogAdapterMessage("PVCAM Adapter version: " + verAdapter.str());
     assert(nRet == DEVICE_OK);
 
     // find camera
     if (!pl_cam_get_name(cameraId_, camName_))
     {
-        LogCamError(__LINE__, "pl_cam_get_name");
+        LogPvcamError(__LINE__, "pl_cam_get_name");
         return ERR_CAMERA_NOT_FOUND;
     }
 
-    LogMessage("PVCAM: Opening camera...");
+    LogAdapterMessage("Opening camera...");
 
     // Get a handle to the camera
     if (!pl_cam_open(camName_, &hPVCAM_, OPEN_EXCLUSIVE ))
-        return LogCamError(__LINE__, "pl_cam_open" );
+        return LogPvcamError(__LINE__, "pl_cam_open failed" );
 
     refCount_++;
 
     /// --- STATIC PROPERTIES
     /// are properties that are not changed during session. These are read-out only once.
-    LogMessage( "PVCAM: Initializing Static Camera Properties" );
+    LogAdapterMessage( "Initializing Static Camera Properties" );
     nRet = initializeStaticCameraParams();
     if ( nRet != DEVICE_OK )
         return nRet;
 
     /// --- BUILD THE SPEED TABLE
-    LogMessage( "PVCAM: Building Speed Table" );
+    LogAdapterMessage( "Building Speed Table" );
     nRet = initializeSpeedTable();
     if ( nRet != DEVICE_OK )
         return nRet;
@@ -463,7 +464,7 @@ int Universal::Initialize()
     /// are properties that may be updated by a camera or changed by the user during session.
     /// These are read upon opening the camera and then updated on various events. These usually
     /// needs a handler that is called by MM when the GUI asks for the property value.
-    LogMessage("PVCAM: Initializing Dynamic Camera Properties");
+    LogAdapterMessage("Initializing Dynamic Camera Properties");
 
     /// COLOR MODE
     bool isColorCcd = false;
@@ -532,6 +533,9 @@ int Universal::Initialize()
 #ifdef PVCAM_3_0_12_SUPPORTED
     /// PARAM_FRAME_BUFFER_SIZE, no UI property but we use it later in the code
     prmFrameBufSize_ = new PvParam<ulong64>( "PARAM_FRAME_BUFFER_SIZE", PARAM_FRAME_BUFFER_SIZE, this, true );
+
+    /// MULTI-ROI SUPPORT CHECK
+    prmRoiCount_ = new PvParam<uns16>("PARAM_ROI_COUNT", PARAM_ROI_COUNT, this, true);
 
     /// EMBEDDED FRAME METADATA FEATURE
     acqCfgNew_.FrameMetadataEnabled = false; // Disabled by default
@@ -693,7 +697,7 @@ int Universal::Initialize()
     prmSmartStreamingValues_ = new PvParam<smart_stream_type>( "PARAM_SMART_STREAM_EXP_PARAMS", PARAM_SMART_STREAM_EXP_PARAMS, this, true );
     if (prmSmartStreamingEnabled_->IsAvailable() && prmSmartStreamingValues_->IsAvailable())
     {
-        LogMessage("PVCAM: This camera supports SMART streaming");
+        LogAdapterMessage("This camera supports SMART streaming");
         pAct = new CPropertyAction (this, &Universal::OnSmartStreamingEnable);
         nRet = CreateProperty(g_Keyword_SmartStreamingEnable, g_Keyword_No, MM::String, false, pAct);
         assert(nRet == DEVICE_OK);
@@ -706,21 +710,14 @@ int Universal::Initialize()
         {
             if (DEVICE_OK == prmSmartStreamingEnabled_->Apply())
             {
-                LogMessage("PVCAM: SMART streaming disabled on launch");
+                LogAdapterMessage("SMART streaming disabled on launch");
             }
 
         }
         //not handling else for the first if because prmSmartStreamingEnabled->Set always returns DEVICE_OK, might be added later
 
-        //number of smartStreamEntries_ initialized has been initiailized to 4 in the constructor, so now 
-        //set initial values to SMART streaming parameters to populate the UI on launch
-        smartStreamValuesDouble_[0] = 10000;
-        smartStreamValuesDouble_[1] = 20000;
-        smartStreamValuesDouble_[2] = 30000;
-        smartStreamValuesDouble_[3] = 40000;
-
         pAct = new CPropertyAction (this, &Universal::OnSmartStreamingValues);
-        nRet = CreateProperty(g_Keyword_SmartStreamingValues, "10000;20000;30000;40000", MM::String, false, pAct);
+        nRet = CreateProperty(g_Keyword_SmartStreamingValues, "", MM::String, false, pAct);
         assert(nRet == DEVICE_OK);
     }
 #endif
@@ -815,7 +812,7 @@ int Universal::Initialize()
         else
             // This must be a developer error, but let's just continue, the correct current 
             // property value is reported in the OnGain() handler anyway.
-            LogCamError( __LINE__, "Current gain name not applicable!" );
+            LogAdapterError(DEVICE_ERR, __LINE__, "Current gain name not applicable!" );
         nRet = CreateProperty(MM::g_Keyword_Gain, gainName.c_str(), MM::String, false, pAct);
         if (nRet != DEVICE_OK)
             return nRet;
@@ -848,8 +845,11 @@ int Universal::Initialize()
     // The PARAM_EXP_RES_INDEX is used to get and set the current exposure resolution (usec, msec, sec, ...)
     // The PARAM_EXP_RES is only used to enumerate the supported exposure resolutions and their string names
     microsecResSupported_ = false;
+    acqCfgNew_.ExposureMs  = 10.0;
+    acqCfgNew_.ExposureRes = EXP_RES_ONE_MILLISEC;
     prmExpResIndex_ = new PvParam<uns16>( "PARAM_EXP_RES_INDEX", PARAM_EXP_RES_INDEX, this, true );
     prmExpRes_ = new PvEnumParam( "PARAM_EXP_RES", PARAM_EXP_RES, this, true );
+    prmExposureTime_ = new PvParam<ulong64>( "PARAM_EXPOSURE_TIME", PARAM_EXPOSURE_TIME, this, true );
     if ( prmExpResIndex_->IsAvailable() )
     {
         if ( prmExpRes_->IsAvailable() )
@@ -859,9 +859,36 @@ int Universal::Initialize()
             {
                 if ( enumVals[i] == EXP_RES_ONE_MICROSEC )
                 {
+                    // If microsec is supported and the camera reports the range,
+                    // we check what is the max microsec range and keep the camera
+                    // running in microsec up to the max range.
+                    if (prmExposureTime_->IsAvailable())
+                    {
+                        // Switch to microsec...
+                        nRet = prmExpRes_->SetAndApply(EXP_RES_ONE_MICROSEC);
+                        if (nRet != DEVICE_OK)
+                            return nRet; // Error logged in SetAndApply()
+                        // We need to re-read the exposure time parameter from PVCAM to
+                        // update the cached values.
+                        nRet = prmExposureTime_->Update();
+                        if (nRet != DEVICE_OK)
+                            return nRet; // Error logged in Update()
+                        // Read the microsec max range
+                        microsecResMax_ = static_cast<uns32>(prmExposureTime_->Max());
+                    }
+
                     microsecResSupported_ = true;
                     break;
                 }
+            }
+            // Switch the resolution to usec if available. We will later switch it
+            // back and forth dynamically based on exposure value and microsec max range
+            if (microsecResSupported_)
+            {
+                nRet = prmExpRes_->SetAndApply(EXP_RES_ONE_MICROSEC);
+                if (nRet != DEVICE_OK)
+                    return nRet; // Error logged in Update()
+                acqCfgNew_.ExposureRes = EXP_RES_ONE_MICROSEC;
             }
         }
     }
@@ -875,11 +902,11 @@ int Universal::Initialize()
         // Some older cameras errorneously report PARAM_GAIN_MULT_FACTOR but are not EM.
         if ((camChipName_.find("ICX-285") != std::string::npos) || (camChipName_.find("ICX285") != std::string::npos))
         {
-            LogMessage("PVCAM: This Camera reports EM Gain available but it's ICX285, so no EM.");
+            LogAdapterMessage("This Camera reports EM Gain available but it's ICX285, so no EM.");
         }
         else
         {
-            LogMessage("PVCAM: This Camera has Em Gain");
+            LogAdapterMessage("This Camera has Em Gain");
             pAct = new CPropertyAction (this, &Universal::OnMultiplierGain);
             nRet = CreateProperty(g_Keyword_MultiplierGain, "1", MM::Integer, false, pAct);
             assert(nRet == DEVICE_OK);
@@ -890,7 +917,7 @@ int Universal::Initialize()
         }
     }
     else
-        LogMessage("PVCAM: This Camera does not have EM Gain");
+        LogAdapterMessage("This Camera does not have EM Gain");
 
 
     if (cameraModel_ == PvCameraModel_OptiMos_M1)
@@ -907,12 +934,12 @@ int Universal::Initialize()
     PvParam<rs_bool> prmFrameCapable( "PARAM_FRAME_CAPABLE", PARAM_FRAME_CAPABLE, this, true );
     if (prmFrameCapable.IsAvailable() && prmFrameCapable.Current() == TRUE)
     {
-        LogMessage( "PVCAM: Frame Transfer mode is available" );
+        LogAdapterMessage( "Frame Transfer mode is available" );
         uns32 pmode = PMODE_FT;
         if ( pl_set_param( hPVCAM_, PARAM_PMODE, &pmode ) != PV_OK )
-            LogCamError( __LINE__, "pl_set_param PARAM_PMODE PMODE_FT" );
+            LogPvcamError( __LINE__, "pl_set_param PARAM_PMODE PMODE_FT" );
     }
-    else LogMessage( "PVCAM: Frame Transfer mode not available" );
+    else LogAdapterMessage( "Frame Transfer mode not available" );
 
     /// FRAME RECOVERY
     /// Enable/Disable the feature that attempts to recover from lost callbacks
@@ -927,18 +954,19 @@ int Universal::Initialize()
     /// properties that allow to enable/disable/set various post processing features
     /// supported by Photometrics cameras. The parameter properties are read out from
     /// the camera and created automatically.
-    LogMessage( "PVCAM: Initializing Post Processing features..." );
+    LogAdapterMessage( "Initializing Post Processing features..." );
     initializePostProcessing();
-    LogMessage( "PVCAM: Post Processing initialized" );
+    LogAdapterMessage( "Post Processing initialized" );
 
     // setup imaging
     if (!pl_exp_init_seq())
-        return LogCamError(__LINE__, "pl_exp_init_seq");
+        return LogPvcamError(__LINE__, "pl_exp_init_seq");
 
     // Circular buffer auto/manual switch
+    acqCfgNew_.CircBufSizeAuto = true;
     pAct = new CPropertyAction(this, &Universal::OnCircBufferSizeAuto);
     nRet = CreateProperty( g_Keyword_CircBufSizeAuto,
-        circBufSizeAuto_ ? g_Keyword_ON : g_Keyword_OFF, MM::String, false, pAct);
+        acqCfgNew_.CircBufSizeAuto ? g_Keyword_ON : g_Keyword_OFF, MM::String, false, pAct);
     AddAllowedValue(g_Keyword_CircBufSizeAuto, g_Keyword_ON);
     AddAllowedValue(g_Keyword_CircBufSizeAuto, g_Keyword_OFF);
 
@@ -947,13 +975,13 @@ int Universal::Initialize()
     // may help in some cases (e.g. lowering it down to 3 helped to resolve ICX-674 image tearing issues)
     pAct = new CPropertyAction(this, &Universal::OnCircBufferFrameCount);
     nRet = CreateProperty( g_Keyword_CircBufFrameCnt,
-        CDeviceUtils::ConvertToString(CIRC_BUF_FRAME_CNT_DEF), MM::Integer, circBufSizeAuto_, pAct);
+        CDeviceUtils::ConvertToString(CIRC_BUF_FRAME_CNT_DEF), MM::Integer, acqCfgNew_.CircBufSizeAuto, pAct);
     // If we are in auto mode the property has no limits because the value is read only and adjusted
     // automatically by internal algorithm or PVCAM. In manual mode we just set the initial range that
     // is later dynamically adjusted by actual frame size.
     // Note: passing 0, 0 will disable the limit checking but for some reason returns an error so
     // we don't check the error code for SetPropertyLimits() here. See also: updateCircBufRange()
-    if (circBufSizeAuto_)
+    if (acqCfgNew_.CircBufSizeAuto)
         SetPropertyLimits( g_Keyword_CircBufFrameCnt, 0, 0);
     else
         SetPropertyLimits( g_Keyword_CircBufFrameCnt, CIRC_BUF_FRAME_CNT_MIN, CIRC_BUF_FRAME_CNT_MAX );
@@ -972,12 +1000,12 @@ int Universal::Initialize()
         nRet = CreateProperty(g_Keyword_AcqMethod, g_Keyword_AcqMethod_Polling, MM::String, false, pAct );
         AddAllowedValue(g_Keyword_AcqMethod, g_Keyword_AcqMethod_Polling);
         AddAllowedValue(g_Keyword_AcqMethod, g_Keyword_AcqMethod_Callbacks);
-        LogMessage( "PVCAM: Using callbacks for frame acquisition" );
+        LogAdapterMessage( "Using callbacks for frame acquisition" );
         acqCfgNew_.CallbacksEnabled = true;
     }
     else
     {
-        LogMessage( "PVCAM: pl_cam_register_callback_ex3 failed! Using polling for frame acquisition" );
+        LogAdapterMessage( "pl_cam_register_callback_ex3 failed! Using polling for frame acquisition" );
     }
 #endif
 
@@ -986,7 +1014,7 @@ int Universal::Initialize()
     // Initialize the FRAME_INFO structure, this will contain the frame metadata provided by PVCAM
     if ( !pl_create_frame_info_struct( &pFrameInfo_ ) )
     {
-        return LogCamError(__LINE__, "Failed to initialize the FRAME_INFO structure");
+        return LogPvcamError(__LINE__, "Failed to initialize the FRAME_INFO structure");
     }
 #endif
 
@@ -1011,7 +1039,7 @@ int Universal::Initialize()
             // Apply the signal we want to work with
             nRet = prmTrigTabSignal_->SetAndApply(trigVal);
             if (nRet != DEVICE_OK)
-                return LogCamError(__LINE__, "Failed to set trigger signal");
+                return LogAdapterError(nRet, __LINE__, "Failed to set trigger signal");
 
             // Check the property of each signal and build the UI properties
             // At the moment we support the PARAM_LAST_MUXED_SIGNAL only
@@ -1024,7 +1052,7 @@ int Universal::Initialize()
                 CPropertyActionEx *pExAct = new CPropertyActionEx(this, &Universal::OnTrigTabLastMux, trigVal);
                 nRet = CreateProperty(propName.c_str(), CDeviceUtils::ConvertToString(curVal), MM::String, false, pExAct);
                 if (nRet != DEVICE_OK)
-                    return LogCamError(__LINE__, "Failed to create property for PARAM_LAST_MUXED_SIGNAL");
+                    return LogAdapterError(nRet, __LINE__, "Failed to create property for PARAM_LAST_MUXED_SIGNAL");
                 // The MUX won't be a high number (4 physical cables for Prime) so we will display
                 // the property as a combo box with a couple of allowed values
                 for (int val = minVal; val <= maxVal; ++val)
@@ -1051,7 +1079,7 @@ int Universal::Initialize()
         pAct = new CPropertyAction(this, &Universal::OnPMode);
         nRet = CreateProperty(g_Keyword_PMode, curStr.c_str(), MM::String, false, pAct);
         if (nRet != DEVICE_OK)
-            return LogCamError(__LINE__, "Failed to create property for PARAM_PMODE");
+            return LogAdapterError(nRet, __LINE__, "Failed to create property for PARAM_PMODE");
 
         for (size_t i = 0; i < pmodeStrs.size(); ++i)
         {
@@ -1065,12 +1093,19 @@ int Universal::Initialize()
     pAct = new CPropertyAction(this, &Universal::OnCircBufferEnabled);
     nRet = CreateProperty( g_Keyword_CircBufEnabled, g_Keyword_ON, MM::String, false, pAct);
     if (nRet != DEVICE_OK)
-        return LogCamError(__LINE__, "Failed to create property for Circular Buffer mode");
+        return LogAdapterError(nRet, __LINE__, "Failed to create property for Circular Buffer mode");
     AddAllowedValue(g_Keyword_CircBufEnabled, g_Keyword_ON);
     AddAllowedValue(g_Keyword_CircBufEnabled, g_Keyword_OFF);
 
     // Initialize the acquisition configuration
-    acqCfgNew_.Roi = PvRoi(0, 0, camSerSize_, camParSize_);
+    unsigned int maxRois = 1;
+    if (prmRoiCount_ && prmRoiCount_->IsAvailable())
+        maxRois = prmRoiCount_->Max();
+    acqCfgNew_.Rois.SetCapacity(maxRois);
+    acqCfgNew_.Rois.Add(PvRoi(0, 0, camSerSize_, camParSize_));
+    // We know the max ROIs so update our error message
+    SetErrorText(ERR_TOO_MANY_ROIS,
+        std::string("Device supports only " + std::to_string((long long)maxRois) + " ROI(s).").c_str());
 
     // Make sure our configs are synchronized
     acqCfgCur_ = acqCfgNew_;
@@ -1099,18 +1134,18 @@ int Universal::Shutdown()
 #endif
         ret = pl_exp_uninit_seq();
         if (!ret)
-            LogCamError(__LINE__, "pl_exp_uninit_seq");
+            LogPvcamError(__LINE__, "pl_exp_uninit_seq");
         assert(ret);
         ret = pl_cam_close(hPVCAM_);
         if (!ret)
-            LogCamError(__LINE__, "pl_cam_close");
+            LogPvcamError(__LINE__, "pl_cam_close");
         assert(ret);     
         refCount_--;      
         if (PVCAM_initialized_ && refCount_ <= 0)      
         {
             refCount_ = 0;
             if (!pl_pvcam_uninit())
-                LogCamError(__LINE__, "pl_pvcam_uninit");
+                LogPvcamError(__LINE__, "pl_pvcam_uninit");
             PVCAM_initialized_ = false;
         }      
 #ifdef PVCAM_FRAME_INFO_SUPPORTED
@@ -1166,17 +1201,18 @@ int Universal::SnapImage()
 
         if(snappingSingleFrame_)
         {
-            LogMessage("SnapImage() failed: GetImage() has not been done for previous frame", true);
+            LogAdapterMessage("SnapImage() failed: GetImage() has not been done for previous frame", true);
             return DEVICE_ERR;
         }
         if(isAcquiring_)
         {
-            LogMessage("SnapImage() failed: Camera already acquiring.", true);
+            LogAdapterMessage("SnapImage() failed: Camera already acquiring.", true);
             return DEVICE_CAMERA_BUSY_ACQUIRING;
         }
 
         startTs = GetCurrentMMTime();
 
+        acqCfgNew_.AcquisitionType = AcqType_Snap;
         nRet = applyAcqConfig();
         if (nRet != DEVICE_OK)
             return nRet;
@@ -1185,14 +1221,14 @@ int Universal::SnapImage()
         {
             g_pvcamLock.Lock();
             if (pl_exp_stop_cont(hPVCAM_, CCS_HALT) != PV_OK)
-                LogCamError(__LINE__, "pl_exp_stop_cont() failed", pl_error_code());
+                LogPvcamError(__LINE__, "pl_exp_stop_cont() failed", pl_error_code());
             if (pl_exp_finish_seq(hPVCAM_, circBuf_.Data(), 0) != PV_OK)
-                LogCamError(__LINE__, "pl_exp_finish_seq() failed", pl_error_code());
+                LogPvcamError(__LINE__, "pl_exp_finish_seq() failed", pl_error_code());
             g_pvcamLock.Unlock();
 
             nRet = resizeImageBufferSingle();
             if (nRet != DEVICE_OK) 
-                return LogMMError(nRet, __LINE__);
+                return LogAdapterError(nRet, __LINE__, "Failed to resize the image buffer");
             singleFrameModeReady_ = true;
         }
 
@@ -1226,16 +1262,6 @@ int Universal::SnapImage()
             singleFrameModeReady_ = false;
         }
 
-#ifdef PVCAM_SMART_STREAMING_SUPPORTED
-        g_pvcamLock.Lock(); 
-        //after the image was snapped enable SMART streaming if it was enabled before the Snap
-        if (ssWasOn_ == true)
-        {
-            SetProperty(g_Keyword_SmartStreamingEnable, g_Keyword_Yes);
-        }
-        g_pvcamLock.Unlock();
-#endif
-
         const MM::MMTime endTs = GetCurrentMMTime();
         LogTimeDiff(startTs, endTs, "SnapImage() took: ", true);
 
@@ -1250,7 +1276,7 @@ const unsigned char* Universal::GetImageBuffer()
 
     if(!snappingSingleFrame_)
     {
-        LogMMMessage(__LINE__, "Warning: GetImageBuffer called before SnapImage()");
+        LogAdapterMessage(__LINE__, "Warning: GetImageBuffer called before SnapImage()");
         return 0;
     }
 
@@ -1265,7 +1291,7 @@ const unsigned int* Universal::GetImageBufferAsRGB32()
 
     if(!snappingSingleFrame_)
     {
-        LogMMMessage(__LINE__, "Warning: GetImageBufferAsRGB32 called before SnapImage()");
+        LogAdapterMessage(__LINE__, "Warning: GetImageBufferAsRGB32 called before SnapImage()");
         return 0;
     }
 
@@ -1276,33 +1302,39 @@ const unsigned int* Universal::GetImageBufferAsRGB32()
 
 unsigned Universal::GetImageWidth() const
 {
-    return acqCfgCur_.Roi.ImageRgnWidth();
+    const unsigned int width = acqCfgCur_.Rois.ImpliedRoi().ImageRgnWidth();
+    return width;
 }
 
 unsigned Universal::GetImageHeight() const 
 {
-    return acqCfgCur_.Roi.ImageRgnHeight();
+    const unsigned int height = acqCfgCur_.Rois.ImpliedRoi().ImageRgnHeight();
+    return height;
 }
 
 unsigned Universal::GetImageBytesPerPixel() const
 {
-    return acqCfgCur_.ColorProcessingEnabled ? 4 : 2;
+    const unsigned int bpp = acqCfgCur_.ColorProcessingEnabled ? 4 : 2;
+    return bpp;
 }
 
 long Universal::GetImageBufferSize() const
 {
     const int bytesPerPixel = acqCfgCur_.ColorProcessingEnabled ? 4 : 2;
-    return acqCfgCur_.Roi.ImageRgnWidth() * acqCfgCur_.Roi.ImageRgnHeight() * bytesPerPixel;
+    const long bufferSize = acqCfgCur_.Rois.ImpliedRoi().ImageRgnWidth() * acqCfgCur_.Rois.ImpliedRoi().ImageRgnHeight() * bytesPerPixel;
+    return bufferSize;
 }
 
 unsigned Universal::GetBitDepth() const
 {
-    return acqCfgCur_.ColorProcessingEnabled ? 8 : (unsigned)camCurrentSpeed_.bitDepth;
+    const unsigned int bitDepth = acqCfgCur_.ColorProcessingEnabled ? 8 : (unsigned)camCurrentSpeed_.bitDepth;
+    return bitDepth;
 }
 
 int Universal::GetBinning() const 
 {
-    return acqCfgCur_.Roi.BinX();
+    const int bin = acqCfgCur_.Rois.BinX();
+    return bin;
 }
 
 int Universal::SetBinning(int binSize) 
@@ -1326,7 +1358,7 @@ void Universal::SetExposure(double exp)
     START_METHOD("Universal::SetExposure");
     int ret = SetProperty(MM::g_Keyword_Exposure, CDeviceUtils::ConvertToString(exp));
     if (ret != DEVICE_OK)
-        LogMMError(ret, __LINE__);
+        LogAdapterError(ret, __LINE__, "Failed to set the exposure");
 }
 
 int Universal::IsExposureSequenceable(bool& isSequenceable) const
@@ -1350,19 +1382,22 @@ int Universal::SetROI(unsigned x, unsigned y, unsigned xSize, unsigned ySize)
     // (This check avoids crash for 1x1 ROIs in PVCAM 2.9.5)
     if ( xSize * ySize < 4 )
     {
-        LogCamError( __LINE__, "Universal::SetROI ROI size not supported" );
-        return ERR_ROI_SIZE_NOT_SUPPORTED;
+        return LogAdapterError( ERR_ROI_SIZE_NOT_SUPPORTED, __LINE__,
+            "Universal::SetROI ROI size not supported" );
     }
 
     // We keep the ROI definition in sensor coordinates however the coordinates given by uM are
     // related to the actual image the ROI was drawn on. We need to take the current binning
     // into account.
-    const PvRoi& curRoi = acqCfgCur_.Roi;
-    acqCfgNew_.Roi.SetSensorRgn(
-        static_cast<uns16>(x * curRoi.BinX()),
-        static_cast<uns16>(y * curRoi.BinY()),
-        static_cast<uns16>(xSize * curRoi.BinX()),
-        static_cast<uns16>(ySize * curRoi.BinY()));
+
+    // Calling this function for camera with multi ROI support should clear
+    // all the multi ROI definitions and revert to single ROI operation.
+    const uns16 bx = acqCfgCur_.Rois.BinX();
+    const uns16 by = acqCfgCur_.Rois.BinY();
+    acqCfgNew_.Rois.Clear();
+    acqCfgNew_.Rois.Add(PvRoi(
+        static_cast<uns16>(x * bx), static_cast<uns16>(y * by),
+        static_cast<uns16>(xSize * bx), static_cast<uns16>(ySize * by), bx, by));
     nRet = applyAcqConfig();
 
     return nRet;
@@ -1372,11 +1407,12 @@ int Universal::GetROI(unsigned& x, unsigned& y, unsigned& xSize, unsigned& ySize
 {
     START_METHOD("Universal::GetROI");
 
-    const PvRoi& roi = acqCfgCur_.Roi;
-    x = roi.ImageRgnX();
-    y = roi.ImageRgnY();
-    xSize = roi.ImageRgnWidth();
-    ySize = roi.ImageRgnHeight();
+    const PvRoi& curRoi = acqCfgCur_.Rois.At(0);
+
+    x = curRoi.ImageRgnX();
+    y = curRoi.ImageRgnY();
+    xSize = curRoi.ImageRgnWidth();
+    ySize = curRoi.ImageRgnHeight();
 
     return DEVICE_OK;
 }
@@ -1387,10 +1423,81 @@ int Universal::ClearROI()
 
     int nRet = DEVICE_OK;
 
-    acqCfgNew_.Roi.SetSensorRgn(0, 0, camSerSize_, camParSize_);
+    // Clear the ROI only, keep the binning.
+    const uns16 bx = acqCfgCur_.Rois.BinX();
+    const uns16 by = acqCfgCur_.Rois.BinY();
+
+    acqCfgNew_.Rois.Clear();
+    acqCfgNew_.Rois.Add(PvRoi(0, 0, camSerSize_, camParSize_, bx, by));
     nRet = applyAcqConfig();
 
     return nRet;
+}
+
+bool Universal::SupportsMultiROI()
+{
+    const bool supported = (prmRoiCount_ != 0 && prmRoiCount_->IsAvailable() && prmRoiCount_->Max() > 1);
+    return supported;
+}
+
+bool Universal::IsMultiROISet()
+{
+    const bool isSet = (acqCfgCur_.Rois.Count() > 1);
+    return isSet;
+}
+
+int Universal::GetMultiROICount(unsigned& count)
+{
+    count = static_cast<unsigned>(acqCfgCur_.Rois.Count());
+    return DEVICE_OK;
+}
+
+int Universal::SetMultiROI(const unsigned* xs, const unsigned* ys, const unsigned* widths, const unsigned* heights, unsigned numROIs)
+{
+    int nRet = DEVICE_OK;
+
+    if (numROIs > acqCfgCur_.Rois.Capacity())
+        return ERR_TOO_MANY_ROIS;
+
+    // Get the current binning
+    const uns16 bx = acqCfgCur_.Rois.BinX();
+    const uns16 by = acqCfgCur_.Rois.BinY();
+
+    acqCfgNew_.Rois.Clear();
+    for (unsigned int i = 0; i < numROIs; ++i)
+    {
+        const PvRoi roi(
+            static_cast<uns16>(xs[i] * bx), static_cast<uns16>(ys[i] * by),
+            static_cast<uns16>(widths[i] * bx), static_cast<uns16>(heights[i] * by),
+            bx, by);
+        acqCfgNew_.Rois.Add(roi);
+    }
+
+    nRet = applyAcqConfig();
+    return nRet;
+}
+
+int Universal::GetMultiROI(unsigned* xs, unsigned* ys, unsigned* widths, unsigned* heights, unsigned* length)
+{
+    const unsigned roiCount = acqCfgCur_.Rois.Count();
+    if (roiCount > *length)
+    {
+       // This should never happen.
+       return DEVICE_INTERNAL_INCONSISTENCY;
+    }
+
+    for (unsigned int i = 0; i < roiCount; ++i)
+    {
+        const PvRoi& roi = acqCfgCur_.Rois.At(i);
+        xs[i] = roi.ImageRgnX();
+        ys[i] = roi.ImageRgnY();
+        widths[i] = roi.ImageRgnWidth();
+        heights[i] = roi.ImageRgnHeight();
+    }
+
+    *length = roiCount;
+
+    return DEVICE_OK;
 }
 
 bool Universal::IsCapturing()
@@ -1446,6 +1553,7 @@ int Universal::StartSequenceAcquisition(long numImages, double interval_ms, bool
 
     int ret = DEVICE_OK;
 
+    acqCfgNew_.AcquisitionType = AcqType_Live;
     ret = applyAcqConfig();
     if (ret != DEVICE_OK)
         return ret;
@@ -1461,6 +1569,9 @@ int Universal::StartSequenceAcquisition(long numImages, double interval_ms, bool
     imagesRecovered_ = 0;
     lastPvFrameNr_   = 0;
 
+    // initially start with the exposure time as the actual interval estimate
+    SetProperty(MM::g_Keyword_ActualInterval_ms, CDeviceUtils::ConvertToString(acqCfgCur_.ExposureMs)); 
+
     // Cache the current device label so we don't have to copy it for every frame
     GetLabel(deviceLabel_); 
     eofEvent_.Reset(); // Reset the EOF event, we will wait for it to become signalled
@@ -1471,7 +1582,7 @@ int Universal::StartSequenceAcquisition(long numImages, double interval_ms, bool
         {
             const int16 pvErr = pl_error_code();
             g_pvcamLock.Unlock();
-            LogCamError(__LINE__, "pl_exp_start_cont()", pvErr);
+            LogPvcamError(__LINE__, "pl_exp_start_cont()", pvErr);
             resizeImageBufferSingle();
             return pvErr;
         }
@@ -1484,8 +1595,9 @@ int Universal::StartSequenceAcquisition(long numImages, double interval_ms, bool
     }
     startTime_ = GetCurrentMMTime();
 
-    // initially start with the exposure time as the actual interval estimate
-    SetProperty(MM::g_Keyword_ActualInterval_ms, CDeviceUtils::ConvertToString(exposure_)); 
+    // Once we call start_cont() we don't want to spend much time in this function because
+    // the callbacks will start coming pretty fast. Do not waste time here, what can be done
+    // before start_cont() should be done there.
 
     if ( !acqCfgCur_.CallbacksEnabled && acqCfgCur_.CircBufEnabled )
     {
@@ -1495,55 +1607,25 @@ int Universal::StartSequenceAcquisition(long numImages, double interval_ms, bool
 
     ostringstream os;
     os << "Started sequence on " << deviceLabel_ << ", at " << startTime_.serialize() << ", with " << numImages << " and " << interval_ms << " ms" << endl;
-    LogMessage(os.str().c_str());
+    LogAdapterMessage(os.str().c_str());
 
     return DEVICE_OK;
 }
 
 int Universal::StopSequenceAcquisition()
 {
-    MMThreadGuard acqGuard(&acqLock_);
-    START_METHOD("Universal::StopSequenceAcquisition");
-    // call function of the base class, which does useful work
     int nRet = DEVICE_OK;
-
-    // removed redundant calls to pl_exp_stop_cont &
-    //  pl_exp_finish_seq because they get called automatically when the thread exits.
-    if(isAcquiring_)
     {
-        if (acqCfgCur_.CircBufEnabled)
-        {
-            if ( acqCfgCur_.CallbacksEnabled )
-            {
-                g_pvcamLock.Lock();
-                if (!pl_exp_stop_cont( hPVCAM_, CCS_CLEAR ))
-                {
-                    nRet = DEVICE_ERR;
-                    LogCamError( __LINE__, "pl_exp_stop_cont() failed" );
-                }
-                g_pvcamLock.Unlock();
-                sequenceModeReady_ = false;
-                // Inform the core that the acquisition has finished
-                // (this also closes the shutter if used)
-                GetCoreCallback()->AcqFinished(this, nRet );
-            }
-            else
-            {
-                pollingThd_->setStop(true);
-                pollingThd_->wait();
-            }
-        }
-        else
-        {
-            acqThd_->Pause();
-        }
-        isAcquiring_ = false;
-        eofEvent_.Set();
-    }
+        MMThreadGuard acqGuard(&acqLock_);
+        START_METHOD("Universal::StopSequenceAcquisition");
 
+        nRet = abortAcquisitionInternal();
+    }
     // LW: Give the camera some time to stop acquiring. This reduces occasional
     //     crashes/hangs when frequently starting/stopping with some fast cameras.
-    CDeviceUtils::SleepMs( 50 );
+    //     Please note this has to be called after the acqLock is unlocked, otherwise
+    //     the PVCAM callback will be kept holding and no flush will occur.
+    CDeviceUtils::SleepMs(100);
 
     return nRet;
 }
@@ -1632,9 +1714,12 @@ int Universal::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
         if (index < 0)
             return DEVICE_CAN_NOT_SET_PROPERTY;
 
-        acqCfgNew_.Roi.SetBinning(
+        acqCfgNew_.Rois.SetBinning(
             static_cast<uns16>(binningValuesX_[index]),
             static_cast<uns16>(binningValuesY_[index]));
+        // Adjust the coordinates to binnning factor immediately because uM will
+        // ask what is the current image size right after that.
+        acqCfgNew_.Rois.AdjustCoords();
         nRet = applyAcqConfig();
         // Workaround: When binning is not accepted by the camera or simply
         // not valid for current configuration (e.g. Centorids active) the
@@ -1651,7 +1736,7 @@ int Universal::OnBinning(MM::PropertyBase* pProp, MM::ActionType eAct)
     else if (eAct == MM::BeforeGet)
     {
         std::stringstream ss;
-        ss << acqCfgCur_.Roi.BinX() << "x" << acqCfgCur_.Roi.BinY();
+        ss << acqCfgCur_.Rois.BinX() << "x" << acqCfgCur_.Rois.BinY();
         pProp->Set(ss.str().c_str());
     }
     return nRet;
@@ -1669,18 +1754,19 @@ int Universal::OnBinningX(MM::PropertyBase* pProp, MM::ActionType eAct)
         pProp->Get(binX);
         if (binX < 1)
         {
-            LogMMError( 0, __LINE__, "Value of BinningX has to be positive" );
             nRet = DEVICE_INVALID_PROPERTY_VALUE;
+            LogAdapterError( nRet, __LINE__, "Value of BinningX has to be positive" );
         }
         else
         {
-            acqCfgNew_.Roi.SetBinningX(static_cast<uns16>(binX));
+            acqCfgNew_.Rois.SetBinningX(static_cast<uns16>(binX));
+            acqCfgNew_.Rois.AdjustCoords();
             nRet = applyAcqConfig();
         }
     }
     else if (eAct == MM::BeforeGet)
     {
-        pProp->Set((long)acqCfgNew_.Roi.BinX());
+        pProp->Set((long)acqCfgNew_.Rois.BinX());
     }
     return nRet;
 }
@@ -1697,18 +1783,19 @@ int Universal::OnBinningY(MM::PropertyBase* pProp, MM::ActionType eAct)
         pProp->Get(binY);
         if (binY < 1)
         {
-            LogMMError( 0, __LINE__, "Value of BinningY has to be positive" );
             nRet = DEVICE_INVALID_PROPERTY_VALUE;
+            LogAdapterError( nRet, __LINE__, "Value of BinningY has to be positive" );
         }
         else
         {
-            acqCfgNew_.Roi.SetBinningY(static_cast<uns16>(binY));
+            acqCfgNew_.Rois.SetBinningY(static_cast<uns16>(binY));
+            acqCfgNew_.Rois.AdjustCoords();
             nRet = applyAcqConfig();
         }
     }
     else if (eAct == MM::BeforeGet)
     {
-        pProp->Set((long)acqCfgNew_.Roi.BinY());
+        pProp->Set((long)acqCfgNew_.Rois.BinY());
     }
     return nRet;
 }
@@ -1716,30 +1803,23 @@ int Universal::OnBinningY(MM::PropertyBase* pProp, MM::ActionType eAct)
 int Universal::OnExposure(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     START_ONPROPERTY("Universal::OnExposure", eAct);
-    // exposure property is stored in milliseconds,
-    // whereas the driver returns the value in seconds
+    // Micro manager passes the Exposure value in milli-seconds, as double.
+    // PVCAM exposure resolution is switchable, se we will need to convert
+    // this value later on.
+    int nRet = DEVICE_OK;
     if (eAct == MM::BeforeGet)
     {
-        pProp->Set(exposure_);
+        pProp->Set(acqCfgCur_.ExposureMs);
     }
     else if (eAct == MM::AfterSet)
     {
-        double oldExposure = exposure_;
-        pProp->Get(exposure_);
+        double newExposure;
+        pProp->Get(newExposure);
 
-        // we need to make sure to reconfigure the acquisition when exposure time changes.
-        if (exposure_ != oldExposure)
-        {
-            // we need to make sure to stop the acquisition when exposure time is changed.
-            if (IsCapturing())
-                StopSequenceAcquisition();
-
-            sequenceModeReady_ = false;
-            singleFrameModeReady_ = false;
-        }
-
+        acqCfgNew_.ExposureMs = newExposure;
+        nRet = applyAcqConfig();
     }
-    return DEVICE_OK;
+    return nRet;
 }
 
 int Universal::OnPixelType(MM::PropertyBase* pProp, MM::ActionType eAct)
@@ -1772,8 +1852,8 @@ int Universal::OnGain(MM::PropertyBase* pProp, MM::ActionType eAct)
         // Convert the gain UI string to actual gain index and apply
         if (camCurrentSpeed_.gainNameMap.find(gainStr) == camCurrentSpeed_.gainNameMap.end())
         {
-            LogCamError(__LINE__, "Gain not supported");
             nRet = DEVICE_CAN_NOT_SET_PROPERTY;
+            LogAdapterError(nRet, __LINE__, "Gain not supported");
         }
         else
         {
@@ -1835,7 +1915,7 @@ int Universal::OnReadoutRate(MM::PropertyBase* pProp, MM::ActionType eAct)
         SpdTabEntry selectedSpd = camSpdTableReverse_[currentPort][selectedSpdString];
         if ( pl_set_param(hPVCAM_, PARAM_SPDTAB_INDEX, (void_ptr)&selectedSpd.spdIndex) != PV_OK )
         {
-            LogCamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX");
+            LogPvcamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX");
             return DEVICE_CAN_NOT_SET_PROPERTY;
         }
         // Update the current speed if everything succeed
@@ -2069,26 +2149,14 @@ int Universal::OnCircBufferSizeAuto(MM::PropertyBase* pProp, MM::ActionType eAct
     {
         string choice;
         pProp->Get(choice);
-        circBufSizeAuto_ = (choice == g_Keyword_ON) ? true : false;
-
-        if (IsCapturing())
-        {
-            StopSequenceAcquisition();
-        }
-        else
-        {
-            // Do not update at live mode, the value gets updated in ResizeImageBufferContinuous
-            const unsigned int size = acqCfgCur_.Roi.ImageRgnWidth() * acqCfgCur_.Roi.ImageRgnHeight() * 2;
-            ret = updateCircBufRange(size);
-        }
-
-        sequenceModeReady_ = false;
+        acqCfgNew_.CircBufSizeAuto = (choice == g_Keyword_ON) ? true : false;
+        ret = applyAcqConfig();
     }
     else if (eAct == MM::BeforeGet)
     {
         const bool bReadOnly = !acqCfgCur_.CircBufEnabled;
         static_cast<MM::Property*>(pProp)->SetReadOnly(bReadOnly);
-        pProp->Set(circBufSizeAuto_ ? g_Keyword_ON : g_Keyword_OFF);
+        pProp->Set(acqCfgCur_.CircBufSizeAuto ? g_Keyword_ON : g_Keyword_OFF);
     }
     return ret;
 }
@@ -2110,7 +2178,7 @@ int Universal::OnCircBufferFrameCount(MM::PropertyBase* pProp, MM::ActionType eA
     }
     else if (eAct == MM::BeforeGet)
     {
-        const bool bReadOnly = circBufSizeAuto_ | !acqCfgCur_.CircBufEnabled;
+        const bool bReadOnly = acqCfgCur_.CircBufSizeAuto | !acqCfgCur_.CircBufEnabled;
         static_cast<MM::Property*>(pProp)->SetReadOnly(bReadOnly);
         pProp->Set(static_cast<long>(circBufFrameCount_));
     }
@@ -2519,7 +2587,7 @@ int Universal::OnPostProcProperties(MM::PropertyBase* pProp, MM::ActionType eAct
 
         if (!pl_set_param(hPVCAM_, PARAM_PP_INDEX, &ppIndx))
         {
-            LogCamError(__LINE__, "pl_set_param PARAM_PP_INDEX");
+            LogPvcamError(__LINE__, "pl_set_param PARAM_PP_INDEX");
             revertPostProcValue( index, pProp );
             return DEVICE_CAN_NOT_SET_PROPERTY;
         }
@@ -2527,13 +2595,13 @@ int Universal::OnPostProcProperties(MM::PropertyBase* pProp, MM::ActionType eAct
         ppIndx = (int16)PostProc_[index].GetpropIndex();
         if (!pl_set_param(hPVCAM_, PARAM_PP_PARAM_INDEX, &ppIndx))
         {
-            LogCamError(__LINE__, "pl_set_param PARAM_PP_PARAM_INDEX");
+            LogPvcamError(__LINE__, "pl_set_param PARAM_PP_PARAM_INDEX");
             revertPostProcValue( index, pProp );
             return DEVICE_CAN_NOT_SET_PROPERTY;
         }
 
         // translate the value from the actual control in MM
-        if (PostProc_[index].GetRange() == 1)
+        if (PostProc_[index].IsBoolean())
         {
             pProp->Get(valueStr);
 
@@ -2552,7 +2620,7 @@ int Universal::OnPostProcProperties(MM::PropertyBase* pProp, MM::ActionType eAct
         // set the actual parameter value in the camera
         if (!pl_set_param(hPVCAM_, PARAM_PP_PARAM, &ppValue))
         {
-            LogCamError( __LINE__, "pl_set_param PARAM_PP_PARAM" );
+            LogPvcamError( __LINE__, "pl_set_param PARAM_PP_PARAM" );
             revertPostProcValue( index, pProp );
             return DEVICE_CAN_NOT_SET_PROPERTY;
         }
@@ -2560,7 +2628,7 @@ int Universal::OnPostProcProperties(MM::PropertyBase* pProp, MM::ActionType eAct
         // Read the value back so we know what value was really applied
         if (!pl_get_param(hPVCAM_, PARAM_PP_PARAM, ATTR_CURRENT, &ppValue))
         {
-            LogCamError( __LINE__, "pl_get_param PARAM_PP_PARAM ATTR_CURRENT" );
+            LogPvcamError( __LINE__, "pl_get_param PARAM_PP_PARAM ATTR_CURRENT" );
             revertPostProcValue( index, pProp );
             return DEVICE_CAN_NOT_SET_PROPERTY;
         }
@@ -2573,7 +2641,7 @@ int Universal::OnPostProcProperties(MM::PropertyBase* pProp, MM::ActionType eAct
         // Here we return the 'cached' parameter values only. We cannot ask camera directly
         // because this part of code might be called when sequence acquisition is active and
         // we cannot ask camera when streaming is on.
-        if (PostProc_[index].GetRange() == 1)
+        if (PostProc_[index].IsBoolean())
         {
             // The property is of a Yes/No type
             ppValue = (uns32)PostProc_[index].GetcurValue();
@@ -2612,7 +2680,7 @@ int Universal::OnResetPostProcProperties(MM::PropertyBase* pProp, MM::ActionType
 
             if(!pl_pp_reset(hPVCAM_))
             {
-                LogCamError(__LINE__, "pl_pp_reset");
+                LogPvcamError(__LINE__, "pl_pp_reset");
                 return DEVICE_CAN_NOT_SET_PROPERTY;
             }
             refreshPostProcValues();
@@ -2636,49 +2704,14 @@ int Universal::OnSmartStreamingEnable(MM::PropertyBase* pProp, MM::ActionType eA
     if (eAct == MM::AfterSet)
     {
         string val;
-
         pProp->Get(val);
 
-        // restart the acquisition only if SMART streaming enable value 
-        // has changed, currently it appears MM is restarting acquisition
-        // whenever a parameter was touched by user in the UI
-        if (prmSmartStreamingEnabled_->Current() != (0 == val.compare(g_Keyword_Yes)) ||
-            !prmSmartStreamingEnabled_->Current()!= (0 == val.compare(g_Keyword_No)))
-        {
-            // The acquisition must be stopped, and will be automatically started again by MMCore
-            if (IsCapturing())
-                StopSequenceAcquisition();
-
-            // this param requires reconfiguration of the acquisition
-            singleFrameModeReady_ = false;
-            sequenceModeReady_ = false;
-        }
-
-        // enable SMART streaming if user selected Yes
-        if ( val.compare(g_Keyword_Yes) == 0 )
-        {
-            if (DEVICE_OK == prmSmartStreamingEnabled_->Set(TRUE))
-            {
-                if (DEVICE_OK != prmSmartStreamingEnabled_->Apply())
-                    return DEVICE_CAN_NOT_SET_PROPERTY;
-            }
-        }
-        // disable SMART streaming if user selected No
-        else
-        {
-            if (DEVICE_OK == prmSmartStreamingEnabled_->Set(FALSE))
-            {
-                if (DEVICE_OK != prmSmartStreamingEnabled_->Apply())
-                    return DEVICE_CAN_NOT_SET_PROPERTY;
-            }
-        }
+        acqCfgNew_.SmartStreamingEnabled = (val.compare(g_Keyword_Yes) == 0);
+        applyAcqConfig();
     }
     else if (eAct == MM::BeforeGet)
     {
-        if ( prmSmartStreamingEnabled_->Current() == TRUE )
-            pProp->Set( g_Keyword_Yes );
-        else
-            pProp->Set( g_Keyword_No );
+        pProp->Set( acqCfgCur_.SmartStreamingEnabled ? g_Keyword_Yes : g_Keyword_No );
     }
     return DEVICE_OK;
 }
@@ -2686,102 +2719,62 @@ int Universal::OnSmartStreamingEnable(MM::PropertyBase* pProp, MM::ActionType eA
 int Universal::OnSmartStreamingValues(MM::PropertyBase* pProp, MM::ActionType eAct)
 {
     START_ONPROPERTY("Universal::OnSmartStreamingValues", eAct);
-    // exposure property is stored in milliseconds,
-    // whereas the driver returns the value in seconds
+    int nRet = DEVICE_OK;
+
+    // S.M.A.R.T streaming exposures are stored as array of doubles. The exposure
+    // is represented in milli-seconds, the same as the generic exposure time value.
     if (eAct == MM::BeforeGet)
     {
-        char expListChars[SMART_STREAM_MAX_EXPOSURES*20];
-        int written = 0;
+        const size_t exposureCount = acqCfgCur_.SmartStreamingExposures.size();
+        const std::vector<double>& exposures = acqCfgCur_.SmartStreamingExposures;
+        std::stringstream str;
+        // Set precision to 0.000 and disable scientific notation
+        str << std::setprecision(3) << std::fixed;
 
-        // for values with decimal part > 0.001 display decimal part
-        // otherwise display value as integer
-        for (int i = 0; i < smartStreamEntries_; i++)
+        for (size_t i = 0; i < exposureCount; i++)
         {
-            if (fabs(smartStreamValuesDouble_[i]/1000-round(smartStreamValuesDouble_[i]/1000)) >= 0.001)
-            {
-                //add semicolon to all but last entry
-                if (i<smartStreamEntries_-1)
-                    written += sprintf(expListChars+written, "%.3f;", smartStreamValuesDouble_[i]/1000);
-                else
-                    written += sprintf(expListChars+written, "%.3f", smartStreamValuesDouble_[i]/1000);
-            }
-            else
-            {
-                //add semicolon to all but last entry
-                if (i<smartStreamEntries_-1)
-                    written += sprintf(expListChars+written, "%.0f;", smartStreamValuesDouble_[i]/1000);
-                else
-                    written += sprintf(expListChars+written, "%.0f", smartStreamValuesDouble_[i]/1000);
-            }
+            str << exposures[i];
+            if (i < exposureCount - 1)
+                str << ";"; // Add semicolon to all but last entry
         }
-        pProp->Set(expListChars);
+        pProp->Set(str.str().c_str());
     }
     else if (eAct == MM::AfterSet)
     {
+        // The S.M.A.R.T streaming is entered by the user in form of:
+        // "10;20;30;40;50" string so we will need to parse the values.
+        std::vector<double> parsedValues;
+
         string expListChars;
-
-        // The acquisition must be stopped, and will be automatically started again by MMCore
-        if (IsCapturing())
-            StopSequenceAcquisition();
-
-        // this param requires reconfiguration of the acquisition
-        singleFrameModeReady_ = false;
-        sequenceModeReady_ = false;
-
         pProp->Get(expListChars);
-        // check only allowed characters have been entered
+
+        // Check only allowed characters have been entered
         if (expListChars.find_first_not_of("0123456789;.") != std::string::npos)
         {
-            LogCamError(__LINE__, "SMART Streaming exposures contain forbidden characters");
-            return DEVICE_INVALID_PROPERTY_VALUE;
+            return LogAdapterError(DEVICE_INVALID_PROPERTY_VALUE, __LINE__,
+                "SMART Streaming exposures contain forbidden characters");
         }
-
-        // currently our cameras support maximum 12 exposures in the SMART streaming list
-        // we have allocated space for 128 (SMART_STREAM_MAX_EXPOSURES) exposures each 
-        // 20 characters long, check that this hasn't been exceeded
-        if (expListChars.length() > 20*SMART_STREAM_MAX_EXPOSURES)
-        {
-            LogCamError(__LINE__, "SMART Streaming exposure string is too long");
-            return DEVICE_INVALID_PROPERTY_VALUE;
-        }
-
-        // check that user entered non-empty string
+        // Check that user entered non-empty string
         if (expListChars.length() == 0)
         {
-            LogCamError(__LINE__, "SMART Streaming values are empty");
-            return DEVICE_INVALID_PROPERTY_VALUE;
+            return LogAdapterError(DEVICE_INVALID_PROPERTY_VALUE, __LINE__,
+                "SMART Streaming values are empty");
         }
 
-
-        // add semicolon after the last entry if user failed to do so
+        // Add semicolon after the last entry if user failed to do so
         // to make the further value processing simpler
-        if (expListChars.at(expListChars.length()-1) != ';') 
+        if (expListChars.at(expListChars.length() - 1) != ';') 
         {
             expListChars.append(";");
         }
 
-        // back up current number of exposures
-        uns16 smartStreamEntriesRecovery = smartStreamEntries_;
+        // Get number of SMART streaming entries
+        const int exposuresEntered = static_cast<int>(std::count(expListChars.begin(), expListChars.end(), ';'));
 
-        // get number of SMART streaming entries
-        smartStreamEntries_ = (uns16)std::count(expListChars.begin(), expListChars.end(), ';');
-
-        // if user entered more than max allowed number of entries
-        // return error and restore previous value of smartStreamEntries
-        if (smartStreamEntries_ > prmSmartStreamingValues_->Max().entries)
-        {
-            LogCamError(__LINE__, "Too many SMART Streaming exposures requested");
-            smartStreamEntries_ = smartStreamEntriesRecovery;
-            return DEVICE_CAN_NOT_SET_PROPERTY;
-        }
-
-        // parse the input string and load the SMART streaming values to our 
-        // internal structure smartStreamValuesDouble_
+        // Parse the input string
         std::size_t foundAt = 0;
         std::size_t oldFoundAt = 0;
-
-
-        for (int i = 0; i < smartStreamEntries_; i++)
+        for (int i = 0; i < exposuresEntered; i++)
         {
             // look for semicolons and read values
             foundAt = expListChars.find(';', foundAt);
@@ -2793,9 +2786,8 @@ int Universal::OnSmartStreamingValues(MM::PropertyBase* pProp, MM::ActionType eA
             // reject this SMART streaming exposure list
             if (expCharLength == 0)
             {
-                LogCamError(__LINE__, "SMART streaming exposure value empty (two semicolons with no value between them)");
-                smartStreamEntries_ = smartStreamEntriesRecovery;
-                return DEVICE_CAN_NOT_SET_PROPERTY;
+                return LogAdapterError(DEVICE_CAN_NOT_SET_PROPERTY, __LINE__,
+                    "SMART streaming exposure value empty (two semicolons with no value between them)");
             }
 
             // we should not need more than 10 values before decimal point and 10 values after decimal point, 
@@ -2804,12 +2796,10 @@ int Universal::OnSmartStreamingValues(MM::PropertyBase* pProp, MM::ActionType eA
             // reason to use SMART streaming with exposures longer than a few hundred miliseconds
             if (expCharLength > 21)
             {
-                LogCamError(__LINE__, "SMART streaming exposure value too large");
-                smartStreamEntries_ = smartStreamEntriesRecovery;
-                return DEVICE_CAN_NOT_SET_PROPERTY;
+                return LogAdapterError(DEVICE_CAN_NOT_SET_PROPERTY, __LINE__,
+                    "SMART streaming exposure value too large");
             }
 
-            // 
             std::string substringExposure = expListChars.substr(oldFoundAt, expCharLength);
 
             // check number of decimal points in each exposure time, return error if more than 
@@ -2817,17 +2807,21 @@ int Universal::OnSmartStreamingValues(MM::PropertyBase* pProp, MM::ActionType eA
             long long nrOfPeriods = std::count(substringExposure.begin(), substringExposure.end(), '.');
             if (nrOfPeriods > 1)
             {
-                LogCamError(__LINE__, "SMART streaming exposure value contains too many decimal points");
-                smartStreamEntries_ = smartStreamEntriesRecovery;
-                return DEVICE_CAN_NOT_SET_PROPERTY;
+                return LogAdapterError(DEVICE_CAN_NOT_SET_PROPERTY, __LINE__,
+                    "SMART streaming exposure value contains too many decimal points");
             }
 
-            smartStreamValuesDouble_[i] = 1000*atof(substringExposure.c_str());
+            const double parsedVal = atof(substringExposure.c_str());
+            parsedValues.push_back(parsedVal);
+
             oldFoundAt = ++foundAt;
         }
 
+        acqCfgNew_.SmartStreamingExposures = parsedValues;
+        nRet = applyAcqConfig();
     }
-    return DEVICE_OK;
+
+    return nRet;
 }
 #endif // PVCAM_SMART_STREAMING_SUPPORTED
 
@@ -2840,50 +2834,82 @@ short Universal::Handle()
     return hPVCAM_;
 }
 
-int16 Universal::LogCamError(int lineNr, const std::string& message, int16 pvErrCode, bool debug) throw()
+int Universal::LogPvcamError(int lineNr, const std::string& message, int16 pvErrCode, bool debug) throw()
 {
+    const int mmErrCode = ERR_PVCAM_OFFSET + pvErrCode;
     try
     {
-        char msg[ERROR_MSG_LEN];
-        if(!pl_error_message (pvErrCode, msg))
+        char pvErrMsg[ERROR_MSG_LEN];
+        if(!pl_error_message (pvErrCode, pvErrMsg))
         {
-            CDeviceUtils::CopyLimitedString(msg, "[pl_error_message() FAILED!]");
+            CDeviceUtils::CopyLimitedString(pvErrMsg, "[pl_error_message() FAILED!]");
         }
+
         ostringstream os;
-        os << "PVCAM API error: \""<< msg <<"\", code: " << pvErrCode << "\n";
-        os << "In file: " << __FILE__ << ", " << "line: " << lineNr << ", " << message; 
+
+        // Construct the debug log message and UI message
+        // Log example:
+        //   "[PVCAM] ERROR: 'Acquisition failed'. PVCAM Err:36, Msg:'Script invalid (C0_SCRIPT_INVALID)' [PVCamUniversal.cpp(36)]"
+        // UI message does not contain the file and line information
+
+        os << "[PVCAM] ERR: " << message;
+        os << ", pvErr:" << pvErrCode << ", pvMsg:'" << pvErrMsg << "'";
+
+        // Stop right here and make it a UI message
+        SetErrorText(mmErrCode, os.str().c_str());
+
+        // Append the file and line info: "[PVCAMUniversal.cpp(1234)]"
+        os << " [" << __FILE__ << "(" << lineNr << ")]"; 
         LogMessage(os.str(), debug);
-        SetErrorText(pvErrCode, msg);
     }
     catch(...){}
 
-    return pvErrCode;
+    return mmErrCode;
 }
 
-int Universal::LogMMError(int errCode, int lineNr, std::string message, bool debug) const throw()
+int Universal::LogAdapterError(int mmErrCode, int lineNr, const std::string& message, bool debug) const throw()
 {
     try
     {
-        char strText[MM::MaxStrLength];
-        if (!CCameraBase<Universal>::GetErrorText(errCode, strText))
+        char mmErrMsg[MM::MaxStrLength];
+        if (!CCameraBase<Universal>::GetErrorText(mmErrCode, mmErrMsg))
         {
-            CDeviceUtils::CopyLimitedString(strText, "Unknown");
+            CDeviceUtils::CopyLimitedString(mmErrMsg, "Unknown");
         }
+
         ostringstream os;
-        os << "Error code "<< errCode << ": " <<  strText <<"\n";
-        os << "In file: " << __FILE__ << ", " << "line: " << lineNr << ", " << message; 
+        os << "[PVCAM] ERR: " << message;
+        os << ", mmErr:"<< mmErrCode << ", mmMsg:'" <<  mmErrMsg << "'";
+        
+        // Append the file and line info: "[PVCAMUniversal.cpp(1234)]"
+        os << " [" << __FILE__ << "(" << lineNr << ")]"; 
         LogMessage(os.str(), debug);
     }
     catch(...) {}
-    return errCode;
+
+    return mmErrCode;
 }
 
-void Universal::LogMMMessage(int lineNr, std::string message, bool debug) const throw()
+void Universal::LogAdapterMessage(int lineNr, const std::string& message, bool debug) const throw()
 {
     try
     {
         ostringstream os;
-        os << message << ", in file: " << __FILE__ << ", " << "line: " << lineNr; 
+        os << "[PVCAM] INF: " << message;
+
+        // Append the file and line info: "[PVCAMUniversal.cpp(1234)]"
+        os << " [" << __FILE__ << "(" << lineNr << ")]"; 
+        LogMessage(os.str(), debug);
+    }
+    catch(...){}
+}
+
+void  Universal::LogAdapterMessage(const std::string& message, bool debug) const throw()
+{
+    try
+    {
+        ostringstream os;
+        os << "[PVCAM] INF: " << message;
         LogMessage(os.str(), debug);
     }
     catch(...){}
@@ -2904,7 +2930,6 @@ int Universal::FrameAcquired()
         return DEVICE_OK;
 
     rs_bool     rsbRet = FALSE;
-    int16       pvErr = 0;
     void_ptr    pCurrFramePtr = 0;
     PvFrameInfo currFrameNfo;
     currFrameNfo.SetTimestampMsec(GetCurrentMMTime().getMsec());
@@ -2913,7 +2938,7 @@ int Universal::FrameAcquired()
     g_pvcamLock.Lock();
     rsbRet = pl_exp_get_latest_frame_ex(hPVCAM_, &pCurrFramePtr, pFrameInfo_ );
     if (rsbRet != PV_OK)
-        pvErr = pl_error_code();
+        LogPvcamError(__LINE__, "pl_exp_get_latest_frame_ex() failed");
     g_pvcamLock.Unlock();
     if (rsbRet == PV_OK)
     {
@@ -3029,16 +3054,16 @@ int Universal::FrameAcquired()
     g_pvcamLock.Lock();
     rsbRet = pl_exp_get_latest_frame(hPVCAM_, &pCurrFramePtr ); 
     if (rsbRet != PV_OK)
-        pvErr = pl_error_code();
+        LogPvcamError(__LINE__, "pl_exp_get_latest_frame() failed");
     g_pvcamLock.Unlock();
 #endif // PVCAM_FRAME_INFO_SUPPORTED
 
     if ( rsbRet != PV_OK )
     {
         g_pvcamLock.Lock();
-        pl_exp_abort( hPVCAM_, CCS_CLEAR );
+        if (pl_exp_abort( hPVCAM_, CCS_CLEAR ) != PV_OK)
+            LogPvcamError(__LINE__, "pl_exp_abort() failed");
         g_pvcamLock.Unlock();
-        LogCamError(__LINE__, "pl_exp_get_latest_frame() failed", pvErr);
         return DEVICE_ERR;
     }
 
@@ -3084,32 +3109,15 @@ int Universal::PushImageToMmCore(const unsigned char* pPixBuffer, Metadata* pMd 
     int nRet = DEVICE_ERR;
     MM::Core* pCore = GetCoreCallback();
     // This method inserts a new image into the circular buffer (residing in MMCore)
-    nRet = pCore->InsertMultiChannel(this,
-        pPixBuffer,
-        1,
-        GetImageWidth(),
-        GetImageHeight(),
-        GetImageBytesPerPixel(),
-#ifdef _DEBUG
-        NULL); // Inserting the md causes crash in debug builds
-#else
-        pMd);
-#endif
+    nRet = pCore->InsertImage(this, pPixBuffer, GetImageWidth(), GetImageHeight(),
+        GetImageBytesPerPixel(), pMd->Serialize().c_str());
+
     if (!stopOnOverflow_ && nRet == DEVICE_BUFFER_OVERFLOW)
     {
         // do not stop on overflow - just reset the buffer
         pCore->ClearImageBuffer(this);
-        nRet = pCore->InsertMultiChannel(this,
-            pPixBuffer,
-            1,
-            GetImageWidth(),
-            GetImageHeight(),
-            GetImageBytesPerPixel(),
-#ifdef _DEBUG
-            NULL); // Inserting the md causes crash in debug builds
-#else
-            pMd);
-#endif
+        nRet = pCore->InsertImage(this, pPixBuffer, GetImageWidth(), GetImageHeight(),
+            GetImageBytesPerPixel(), pMd->Serialize().c_str(), false);
     }
 
     return nRet;
@@ -3246,7 +3254,7 @@ int Universal::ProcessNotification( const NotificationEntry& entry )
     {
         if ( imagesInserted_ >= imagesToAcquire_ || ret != DEVICE_OK )
         {
-            StopSequenceAcquisition();
+            abortAcquisitionInternal();
         }
     }
 
@@ -3288,7 +3296,7 @@ int Universal::PollingThreadRun(void)
 
         sprintf( dbgBuf, "ACQ LOOP FINISHED: thdGetStop:%u, ret:%u, imagesInserted_: %lu, imagesToAcquire_: %lu", \
             pollingThd_->getStop(), ret, imagesInserted_, imagesToAcquire_);
-        LogMMMessage( __LINE__, dbgBuf );
+        LogAdapterMessage( __LINE__, dbgBuf );
 
         if (imagesInserted_ >= imagesToAcquire_)
             imagesInserted_ = 0;
@@ -3301,7 +3309,7 @@ int Universal::PollingThreadRun(void)
     }
     catch(...)
     {
-        LogMessage(g_Msg_EXCEPTION_IN_THREAD, false);
+        LogAdapterMessage(g_Msg_EXCEPTION_IN_THREAD, false);
         OnThreadExiting();
         pollingThd_->setStop(true);
         return ret;
@@ -3315,20 +3323,20 @@ void Universal::PollingThreadExiting() throw ()
     {
         g_pvcamLock.Lock();
         if (!pl_exp_stop_cont(hPVCAM_, CCS_HALT)) 
-            LogCamError(__LINE__, "pl_exp_stop_cont");
+            LogPvcamError(__LINE__, "pl_exp_stop_cont");
         if (!pl_exp_finish_seq(hPVCAM_, circBuf_.Data(), 0))
-            LogCamError(__LINE__, "pl_exp_finish_seq");
+            LogPvcamError(__LINE__, "pl_exp_finish_seq");
         g_pvcamLock.Unlock();
 
         sequenceModeReady_ = false;
         isAcquiring_       = false;
 
-        LogMessage(g_Msg_SEQUENCE_ACQUISITION_THREAD_EXITING);
+        LogAdapterMessage(g_Msg_SEQUENCE_ACQUISITION_THREAD_EXITING);
         GetCoreCallback()?GetCoreCallback()->AcqFinished(this,0):DEVICE_OK;
     }
     catch (...)
     {
-        LogMMMessage(__LINE__, g_Msg_EXCEPTION_IN_ON_THREAD_EXITING);
+        LogAdapterMessage(__LINE__, g_Msg_EXCEPTION_IN_ON_THREAD_EXITING);
     }
 }
 
@@ -3382,7 +3390,7 @@ int Universal::initializeStaticCameraParams()
         uns16 versionMajor = (fwVersion >> 8) & 0x00FF;
         sprintf( buf, "%d.%d", versionMajor, versionMinor );
         nRet = CreateProperty(g_Keyword_FirmwareVersion, buf, MM::String, true);
-        LogMessage("PVCAM: PARAM_CAM_FW_VERSION: " + std::string(buf));
+        LogAdapterMessage("PARAM_CAM_FW_VERSION: " + std::string(buf));
     }
 
     // CCD Full Well capacity
@@ -3404,7 +3412,7 @@ int Universal::initializeStaticCameraParams()
     }
     if (!paramParSize.IsAvailable() || paramParSize.Current() == 0) 
     {   // This is a serious error, we cannot continue
-        return LogCamError(__LINE__, "PVCAM: PARAM_PAR_SIZE is not available or incorrect!");
+        return LogAdapterError(DEVICE_ERR, __LINE__, "PARAM_PAR_SIZE is not available or incorrect!");
     }
     PvParam<uns16> paramSerSize("PARAM_SER_SIZE", PARAM_SER_SIZE, this, true);
     if (paramSerSize.IsAvailable())
@@ -3415,7 +3423,7 @@ int Universal::initializeStaticCameraParams()
     }
     if (!paramParSize.IsAvailable() || paramParSize.Current() == 0)
     {   // This is a serious error, we cannot continue
-        return LogCamError(__LINE__, "PVCAM: PARAM_SER_SIZE is not available or incorrect!");
+        return LogPvcamError(__LINE__, "PARAM_SER_SIZE is not available or incorrect!");
     }
 
     // Frame transfer mode capability is static readonly value
@@ -3483,7 +3491,7 @@ int Universal::initializeUniversalParams()
                     else
                     {
                         // The property will be a simple edit box with editable value
-                        LogMessage("PVCAM: The property has too large range. Not setting limits.");
+                        LogAdapterMessage("The property has too large range. Not setting limits.");
                     }
                 }
             }
@@ -3571,9 +3579,12 @@ int Universal::initializePostProcessing()
 
                                         CPropertyActionEx *pExAct = new CPropertyActionEx(this, &Universal::OnPostProcProperties, CntPP++);
 
+                                        PpParam ppParam(paramNameStream.str().c_str(), i,j);
+
                                         // create a special drop-down control box for booleans
-                                        if (max - min == 1)
+                                        if (min == 0 && max == 1)
                                         {
+                                            ppParam.SetBoolean(true);
                                             nRet = CreateProperty(paramNameStream.str().c_str(), currentValueStream.str().c_str(), MM::String, false, pExAct);
                                             SetAllowedValues(paramNameStream.str().c_str(), boolValues);
                                         }
@@ -3583,10 +3594,7 @@ int Universal::initializePostProcessing()
                                             SetPropertyLimits(paramNameStream.str().c_str(), min, max);
                                         }
 
-                                        PpParam* ptr = new PpParam(paramNameStream.str().c_str(), i,j);
-                                        ptr->SetRange(max-min);
-                                        PostProc_.push_back (*ptr);
-                                        delete ptr;
+                                        PostProc_.push_back (ppParam);
                                     }
                                 }
                             }
@@ -3604,7 +3612,7 @@ int Universal::initializePostProcessing()
         // Reset the post processing and reload all PP values
         if(!pl_pp_reset(hPVCAM_))
         {
-            LogCamError(__LINE__, "pl_pp_reset");
+            LogPvcamError(__LINE__, "pl_pp_reset");
         }
 
         refreshPostProcValues();
@@ -3616,42 +3624,58 @@ int Universal::initializePostProcessing()
 
 int Universal::initializeSpeedTable()
 {
-    uns32 portCount = 0; // Total number of readout ports
-    int32 spdCount = 0;  // Number of speed choices for each port
+    uns32 portCount = 0;  // Total number of readout ports
+    uns32 portCurIdx = 0; // Current PORT selected by the camera, we will restore it
+    int32 spdCount = 0;   // Number of speed choices for each port
+    int16 spdCurIdx = 0;  // Current SPEED selected by the camera, we will restore it
     camSpdTable_.clear();
     camSpdTableReverse_.clear();
 
     if (pl_get_param(hPVCAM_, PARAM_READOUT_PORT, ATTR_COUNT, (void_ptr)&portCount) != PV_OK)
-        return LogCamError(__LINE__, "pl_get_param PARAM_READOUT_PORT ATTR_COUNT" );
+        return LogPvcamError(__LINE__, "pl_get_param PARAM_READOUT_PORT ATTR_COUNT" );
+
+    // Read the current camera port and speed, we will want to restore the camera to this
+    // configuration once we read out the entire speed table
+    if (pl_get_param(hPVCAM_, PARAM_READOUT_PORT, ATTR_CURRENT, (void_ptr)&portCurIdx) != PV_OK)
+        return LogPvcamError(__LINE__, "pl_get_param PARAM_READOUT_PORT ATTR_CURRENT" );
+    if (pl_get_param(hPVCAM_, PARAM_SPDTAB_INDEX, ATTR_CURRENT, (void_ptr)&spdCurIdx) != PV_OK)
+        return LogPvcamError(__LINE__, "pl_get_param PARAM_READOUT_PORT ATTR_COUNT" );
 
     // Iterate through each port and fill in the speed table
     for (uns32 portIndex = 0; portIndex < portCount; portIndex++)
     {
         if (pl_set_param(hPVCAM_, PARAM_READOUT_PORT, (void_ptr)&portIndex) != PV_OK)
-            return LogCamError(__LINE__, "pl_set_param PARAM_READOUT_PORT" );
+            return LogPvcamError(__LINE__, "pl_set_param PARAM_READOUT_PORT" );
 
         if (pl_get_param(hPVCAM_, PARAM_SPDTAB_INDEX, ATTR_COUNT, (void_ptr)&spdCount) != PV_OK)
-            return LogCamError(__LINE__, "pl_get_param PARAM_SPDTAB_INDEX ATTR_COUNT" );
+            return LogPvcamError(__LINE__, "pl_get_param PARAM_SPDTAB_INDEX ATTR_COUNT" );
+
+        // Read the "default" speed for every port, we will select this one if port changes.
+        // Please note we don't read the ATTR_DEFAULT as this one is not properly reported (PVCAM 3.1.9.1)
+        int16 portDefaultSpdIdx = 0;
+        if (pl_get_param(hPVCAM_, PARAM_SPDTAB_INDEX, ATTR_CURRENT, (void_ptr)&portDefaultSpdIdx) != PV_OK)
+            return LogPvcamError(__LINE__, "pl_get_param PARAM_SPDTAB_INDEX ATTR_CURRENT" );
 
         for (int16 spdIndex = 0; spdIndex < spdCount; spdIndex++)
         {
             SpdTabEntry spdEntry;
             spdEntry.portIndex = portIndex;
             spdEntry.spdIndex = spdIndex;
+            spdEntry.portDefaultSpdIdx = portDefaultSpdIdx;
 
             if (pl_set_param(hPVCAM_, PARAM_SPDTAB_INDEX, (void_ptr)&spdEntry.spdIndex) != PV_OK)
-                return LogCamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX" );
+                return LogPvcamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX" );
 
             // Read the pixel time for this speed choice
             if (pl_get_param(hPVCAM_, PARAM_PIX_TIME, ATTR_CURRENT, (void_ptr)&spdEntry.pixTime) != PV_OK)
             {
-                LogCamError(__LINE__, "pl_get_param PARAM_PIX_TIME failed, using default pix time" );
+                LogPvcamError(__LINE__, "pl_get_param PARAM_PIX_TIME failed, using default pix time" );
                 spdEntry.pixTime = MAX_PIX_TIME;
             }
             // Read the bit depth for this speed choice
             if (pl_get_param(hPVCAM_, PARAM_BIT_DEPTH, ATTR_CURRENT, &spdEntry.bitDepth) != PV_OK )
             {
-                return LogCamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_CURRENT" );
+                return LogPvcamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_CURRENT" );
             }
             // Read the sensor color mask for the current speed
             rs_bool colorAvail = FALSE;
@@ -3663,12 +3687,12 @@ int Universal::initializeSpeedTable()
                 int32 colorCount = 0;
                 if (pl_get_param(hPVCAM_, PARAM_COLOR_MODE, ATTR_COUNT, &colorCount) != PV_OK || colorCount < 1)
                 {
-                    return LogCamError(__LINE__, "pl_get_param PARAM_COLOR_MODE ATTR_COUNT" );
+                    return LogPvcamError(__LINE__, "pl_get_param PARAM_COLOR_MODE ATTR_COUNT" );
                 }
                 int32 colorCur = 0;
                 if (pl_get_param(hPVCAM_, PARAM_COLOR_MODE, ATTR_CURRENT, &colorCur) != PV_OK)
                 {
-                    return LogCamError(__LINE__, "pl_get_param PARAM_COLOR_MODE ATTR_CURRENT" );
+                    return LogPvcamError(__LINE__, "pl_get_param PARAM_COLOR_MODE ATTR_CURRENT" );
                 }
                 // We need to find the value/string that corresponds to ATTR_CURRENT value
                 // First a couple of hacks for older cameras. Old PVCAM prior 3.0.5.2 (inclusive) reported
@@ -3701,14 +3725,14 @@ int Universal::initializeSpeedTable()
                     uns32 enumStrLen = 0;
                     if (pl_enum_str_length( hPVCAM_, PARAM_COLOR_MODE, i, &enumStrLen) != PV_OK)
                     {
-                        return LogCamError(__LINE__, "pl_enum_str_length PARAM_COLOR_MODE" );
+                        return LogPvcamError(__LINE__, "pl_enum_str_length PARAM_COLOR_MODE" );
                     }
                     char* enumStrBuf = new char[enumStrLen+1];
                     enumStrBuf[enumStrLen] = '\0';
                     int32 enumVal = 0;
                     if (pl_get_enum_param(hPVCAM_, PARAM_COLOR_MODE, i, &enumVal, enumStrBuf, enumStrLen) != PV_OK)
                     {
-                        return LogCamError(__LINE__, "pl_get_enum_param PARAM_COLOR_MODE" );
+                        return LogPvcamError(__LINE__, "pl_get_enum_param PARAM_COLOR_MODE" );
                     }
                     if (enumVal == colorCur)
                     {
@@ -3719,30 +3743,31 @@ int Universal::initializeSpeedTable()
                     delete[] enumStrBuf;
                 }
                 if (!bFound)
-                    return LogCamError(__LINE__, "ATTR_CURRENT of PARAM_COLOR_MODE does not correspond to any reported ENUM value" );
+                    return LogAdapterError(DEVICE_INTERNAL_INCONSISTENCY, __LINE__,
+                        "ATTR_CURRENT of PARAM_COLOR_MODE does not correspond to any reported ENUM value" );
             }
 
             // Read the gain range for this speed choice if applicable
             if (pl_get_param(hPVCAM_, PARAM_GAIN_INDEX, ATTR_AVAIL, &spdEntry.gainAvail) != PV_OK )
             {
-                LogCamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_AVAIL failed, not using gain at this speed" );
+                LogPvcamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_AVAIL failed, not using gain at this speed" );
                 spdEntry.gainAvail = FALSE;
             }
             if (spdEntry.gainAvail)
             {
                 if (pl_get_param(hPVCAM_, PARAM_GAIN_INDEX, ATTR_MIN, &spdEntry.gainMin) != PV_OK )
                 {
-                    LogCamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_MIN failed, using default" );
+                    LogPvcamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_MIN failed, using default" );
                     spdEntry.gainMin = 1;
                 }
                 if (pl_get_param(hPVCAM_, PARAM_GAIN_INDEX, ATTR_MAX, &spdEntry.gainMax) != PV_OK )
                 {
-                    LogCamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_MAX failed, using default" );
+                    LogPvcamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_MAX failed, using default" );
                     spdEntry.gainMax = 1;
                 }
                 if (pl_get_param(hPVCAM_, PARAM_GAIN_INDEX, ATTR_DEFAULT, &spdEntry.gainDef) != PV_OK )
                 {
-                    LogCamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_DEFAULT failed, using min" );
+                    LogPvcamError(__LINE__, "pl_get_param PARAM_GAIN_INDEX ATTR_DEFAULT failed, using min" );
                     spdEntry.gainDef = spdEntry.gainMin;
                 }
 
@@ -3761,10 +3786,15 @@ int Universal::initializeSpeedTable()
                     {
                         if (pl_set_param(hPVCAM_, PARAM_GAIN_INDEX, &gainIdx) == PV_OK)
                         {
-                            char gainName[MAX_GAIN_NAME_LEN];
-                            if (pl_get_param(hPVCAM_, PARAM_GAIN_NAME, ATTR_CURRENT, gainName) == PV_OK)
+                            char pvGainName[MAX_GAIN_NAME_LEN];
+                            if (pl_get_param(hPVCAM_, PARAM_GAIN_NAME, ATTR_CURRENT, pvGainName) == PV_OK)
                             {
-                                gainNameStr.assign(gainName);
+                                // Workaround if for some reason PVCAM returns empty string
+                                if (strlen(pvGainName) != 0)
+                                {
+                                    gainNameStr.append("-");
+                                    gainNameStr.append(pvGainName);
+                                }
                             }
                         }
                     }
@@ -3784,17 +3814,20 @@ int Universal::initializeSpeedTable()
             camSpdTableReverse_[portIndex][tmp.str()] = spdEntry;
         }
     }
+
     // Since we have iterated through all the ports/speeds/gains we should reset the cam to default state
-    if (pl_set_param(hPVCAM_, PARAM_READOUT_PORT, (void_ptr)&camSpdTable_[0][0].portIndex) != PV_OK)
-        return LogCamError(__LINE__, "pl_set_param PARAM_READOUT_PORT" );
-    if (pl_set_param(hPVCAM_, PARAM_SPDTAB_INDEX, (void_ptr)&camSpdTable_[0][0].spdIndex) != PV_OK)
-        return LogCamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX" );
-    if (camSpdTable_[0][0].gainAvail)
+    const SpdTabEntry& spdDef = camSpdTable_[portCurIdx][spdCurIdx];
+
+    if (pl_set_param(hPVCAM_, PARAM_READOUT_PORT, (void_ptr)&spdDef.portIndex) != PV_OK)
+        return LogPvcamError(__LINE__, "pl_set_param PARAM_READOUT_PORT" );
+    if (pl_set_param(hPVCAM_, PARAM_SPDTAB_INDEX, (void_ptr)&spdDef.spdIndex) != PV_OK)
+        return LogPvcamError(__LINE__, "pl_set_param PARAM_SPDTAB_INDEX" );
+    if (spdDef.gainAvail)
     {
-        if (pl_set_param(hPVCAM_, PARAM_GAIN_INDEX, (void_ptr)&camSpdTable_[0][0].gainDef) != PV_OK)
-            return LogCamError(__LINE__, "pl_set_param PARAM_GAIN_INDEX" );
+        if (pl_set_param(hPVCAM_, PARAM_GAIN_INDEX, (void_ptr)&spdDef.gainDef) != PV_OK)
+            return LogPvcamError(__LINE__, "pl_set_param PARAM_GAIN_INDEX" );
     }
-    camCurrentSpeed_ = camSpdTable_[0][0];
+    camCurrentSpeed_ = spdDef;
 
     return DEVICE_OK;
 }
@@ -3807,26 +3840,27 @@ int Universal::resizeImageBufferContinuous()
 
     try
     {
-        uns32 frameSize = 0;
+        // Obtain the PVCAM exposure time and trigger configuration for pl_exp_seup()
         int16 pvExposureMode = 0;
         uns32 pvExposure = 0;
-        nRet = getPvcamExposureSetupConfig( pvExposureMode, pvExposure );
+        nRet = getPvcamExposureSetupConfig( pvExposureMode, acqCfgCur_.ExposureMs, pvExposure );
         if ( nRet != DEVICE_OK )
             return nRet;
-#ifdef PVCAM_SMART_STREAMING_SUPPORTED
-        if (prmSmartStreamingEnabled_->IsAvailable() && (prmSmartStreamingEnabled_->Current() == TRUE) )
-        {
-            sendSmartStreamingToCamera();
-            pvExposure = 10; //make sure non-zero exposure time is sent in setup in Smart Streaming mode
-        }
-#endif
+
+        // However, if we are running S.M.A.R.T we need to make sure to send a non-zero exposure
+        // value to the pl_exp_setup(). So we need to override it.
+        if (acqCfgCur_.SmartStreamingActive)
+            pvExposure = 10; // Just some random non-zero value
+
         g_pvcamLock.Lock();
-        rgn_type roi = acqCfgCur_.Roi.ToRgnType();
-        if (!pl_exp_setup_cont(hPVCAM_, 1, &roi, pvExposureMode, pvExposure, &frameSize, CIRC_OVERWRITE)) 
+        const rgn_type* rgnArr = acqCfgCur_.Rois.ToRgnArray();
+        const uns16     rgnTot = static_cast<uns16>(acqCfgCur_.Rois.Count());
+        uns32           frameSize = 0;
+        if (!pl_exp_setup_cont(hPVCAM_, rgnTot, rgnArr, pvExposureMode, pvExposure, &frameSize, CIRC_OVERWRITE)) 
         {
             const int16 pvErr = pl_error_code();
             g_pvcamLock.Unlock();
-            nRet = LogCamError(__LINE__, "pl_exp_setup_cont() failed", pvErr);
+            nRet = LogPvcamError(__LINE__, "pl_exp_setup_cont() failed", pvErr);
             SetBinning(1); // The error might have been caused by not supported BIN or ROI, so do a reset
             this->GetCoreCallback()->OnPropertiesChanged(this); // Notify the MM UI to update the BIN and ROI
             SetErrorText( nRet, "Failed to setup the acquisition" );
@@ -3834,7 +3868,7 @@ int Universal::resizeImageBufferContinuous()
         }
         g_pvcamLock.Unlock();
 
-        nRet = postExpSetupInit();
+        nRet = postExpSetupInit(frameSize);
         if (nRet != DEVICE_OK)
             return nRet; // Message logged in the failing method
 
@@ -3843,7 +3877,7 @@ int Universal::resizeImageBufferContinuous()
             return nRet; // Message logged in the failing method
 
         // set up a circular buffer for specified number of frames
-        if (circBufSizeAuto_)
+        if (acqCfgCur_.CircBufSizeAuto)
         {
             if (prmFrameBufSize_ && prmFrameBufSize_->IsAvailable())
             {
@@ -3862,26 +3896,18 @@ int Universal::resizeImageBufferContinuous()
             }
         }
 
-        // This will update the CircularBufferFrameCount property in the Device/Property
-        // browser. We need to call this because we need to reflect the change in circBufFrameCount_.
-        // Also, if we are in manual buffer size mode and binning/ROI is changed during live the
-        // circular buffer limits may get adjusted and this needs to be reflected as well.
-        nRet = updateCircBufRange(frameSize);
-        if (nRet != DEVICE_OK)
-            return nRet;
-
         const ulong64 bufferSize = circBufFrameCount_ * static_cast<ulong64>(frameSize);
 
         // PVCAM API does not support buffers larger that 4GB
         if (bufferSize > 0xFFFFFFFF)
-            return LogMMError(ERR_BUFFER_TOO_LARGE, __LINE__);
+            return LogAdapterError(ERR_BUFFER_TOO_LARGE, __LINE__, "Buffer too large");
 
         // In manual mode we return an error if the buffer size is over the limit. Although
         // we dynamically update the slider range the check here is needed because in some
         // corner cases (like switching binning and not clicking the "Refresh" button) the
         // UI temporarily allows the user to set the incorrect value.
-        if (!circBufSizeAuto_ && bufferSize > CIRC_BUF_SIZE_MAX_USER)
-            return LogMMError(ERR_BUFFER_TOO_LARGE, __LINE__);
+        if (!acqCfgCur_.CircBufSizeAuto && bufferSize > CIRC_BUF_SIZE_MAX_USER)
+            return LogAdapterError(ERR_BUFFER_TOO_LARGE, __LINE__, "Buffer too large");
 
         circBuf_.Resize(frameSize, circBufFrameCount_);
 
@@ -3894,21 +3920,21 @@ int Universal::resizeImageBufferContinuous()
     catch( const std::bad_alloc& e )
     {
         nRet = DEVICE_OUT_OF_MEMORY;
-        LogMessage( e.what() );
+        LogAdapterMessage( e.what() );
     }
     catch( const std::exception& e)
     {
         nRet = DEVICE_ERR;
-        LogMessage( e.what() );
+        LogAdapterMessage( e.what() );
     }
     catch(...)
     {
         nRet = DEVICE_ERR;
-        LogMessage("Unknown exception in ResizeImageBufferContinuous", false);
+        LogAdapterMessage("Unknown exception in ResizeImageBufferContinuous", false);
     }
 
     singleFrameModeReady_ = false;
-    LogMessage("ResizeImageBufferContinuous singleFrameModeReady_=false", true);
+    LogAdapterMessage("ResizeImageBufferContinuous singleFrameModeReady_=false", true);
     return nRet;
 }
 
@@ -3920,31 +3946,23 @@ int Universal::resizeImageBufferSingle()
 
     try
     {
-        uns32 frameSize = 0;
         int16 pvExposureMode = 0;
         uns32 pvExposure = 0;
-        nRet = getPvcamExposureSetupConfig( pvExposureMode, pvExposure );
+        nRet = getPvcamExposureSetupConfig( pvExposureMode, acqCfgCur_.ExposureMs, pvExposure );
         if ( nRet != DEVICE_OK )
             return nRet;
 
         g_pvcamLock.Lock();
-#ifdef PVCAM_SMART_STREAMING_SUPPORTED 
-        // in the single Snap mode turn off the SMART streaming so the exposure used is the one in the exposure field,
-        // not the first one from the SMART streaming list
-        // SMART streaming will be returned to its current state in SnapImage() function 
-        // after the current frame is returned
-        if (prmSmartStreamingEnabled_->Current() == TRUE)
-        {
-            ssWasOn_ = true;
-            SetProperty(g_Keyword_SmartStreamingEnable, g_Keyword_No);
-        }
-#endif
-        rgn_type roi = acqCfgCur_.Roi.ToRgnType();
-        if (!pl_exp_setup_seq(hPVCAM_, 1, 1, &roi, pvExposureMode, pvExposure, &frameSize))
+
+        const rgn_type* rgnArr = acqCfgCur_.Rois.ToRgnArray();
+        const uns16     rgnTot = static_cast<uns16>(acqCfgCur_.Rois.Count());
+        const uns32     expTot = 1;
+        uns32           expSize = 0;
+        if (!pl_exp_setup_seq(hPVCAM_, expTot, rgnTot, rgnArr, pvExposureMode, pvExposure, &expSize))
         {
             const int16 pvErr = pl_error_code();
             g_pvcamLock.Unlock();
-            nRet = LogCamError(__LINE__, "pl_exp_setup_seq() failed", pvErr);
+            nRet = LogPvcamError(__LINE__, "pl_exp_setup_seq() failed", pvErr);
             SetBinning(1); // The error might have been caused by not supported BIN or ROI, so do a reset
             this->GetCoreCallback()->OnPropertiesChanged(this); // Notify the MM UI to update the BIN and ROI
             SetErrorText( nRet, "Failed to setup the acquisition" );
@@ -3952,7 +3970,9 @@ int Universal::resizeImageBufferSingle()
         }
         g_pvcamLock.Unlock();
 
-        nRet = postExpSetupInit();
+        const uns32 frameSize = expSize / expTot;
+
+        nRet = postExpSetupInit(frameSize);
         if (nRet != DEVICE_OK)
             return nRet; // Message logged in the failing method
 
@@ -3992,17 +4012,17 @@ int Universal::resizeImageBufferSingle()
     catch (const std::bad_alloc& e)
     {
         nRet = DEVICE_OUT_OF_MEMORY;
-        LogMessage( e.what() );
+        LogAdapterMessage( e.what() );
     }
     catch (const std::exception& e)
     {
         nRet = DEVICE_ERR;
-        LogMessage( e.what() );
+        LogAdapterMessage( e.what() );
     }
     catch(...)
     {
         nRet = DEVICE_ERR;
-        LogMessage("Caught error in ResizeImageBufferSingle", false);
+        LogAdapterMessage("Caught error in ResizeImageBufferSingle", false);
     }
 
     return nRet;
@@ -4013,12 +4033,12 @@ int Universal::resizeImageProcessingBuffers()
 #ifdef PVCAM_3_0_12_SUPPORTED
     // In case of metadata-enabled acquisition we may need temporary processing
     // buffer. This one should be allocated only if needed and freed otherwise.
-    if (acqCfgNew_.FrameMetadataEnabled && acqCfgNew_.RoiCount > 1)
+    if (acqCfgCur_.FrameMetadataEnabled && acqCfgCur_.RoiCount > 1)
     {
         // Metadata-enabled frames with single ROI don't need black-filling,
         // we can use the data of the single ROI directly.
         // With more ROIs we need blackfilling into separate buffer
-        const size_t imgDataSz = acqCfgCur_.Roi.ImageRgnWidth() * acqCfgCur_.Roi.ImageRgnHeight() * sizeof(uns16);
+        const size_t imgDataSz = acqCfgCur_.Rois.ImpliedRoi().ImageRgnWidth() * acqCfgCur_.Rois.ImpliedRoi().ImageRgnHeight() * sizeof(uns16);
         if (metaBlackFilledBufSz_ != imgDataSz)
         {
             delete[] metaBlackFilledBuf_;
@@ -4040,23 +4060,23 @@ int Universal::resizeImageProcessingBuffers()
 
     // In case of frame metadata enabled we may need to update the helper
     // structure for decoding.
-    if (acqCfgNew_.FrameMetadataEnabled)
+    if (acqCfgCur_.FrameMetadataEnabled)
     {
         // Allocate the helper structure if needed
-        const uns16 roiCount = static_cast<uns16>(acqCfgNew_.RoiCount);
+        const uns16 roiCount = static_cast<uns16>(acqCfgCur_.RoiCount);
         if (metaFrameStruct_)
         {
-            if (metaFrameStruct_->roiCapacity < acqCfgNew_.RoiCount)
+            if (metaFrameStruct_->roiCapacity < acqCfgCur_.RoiCount)
             {
                 // We need to reallocate the structure for more ROIs
                 if (pl_md_release_frame_struct(metaFrameStruct_) != PV_OK)
                 {
-                    LogCamError( __LINE__, "pl_md_release_frame_struct() failed" );
+                    LogPvcamError( __LINE__, "pl_md_release_frame_struct() failed" );
                     return DEVICE_ERR;
                 }
                 if (pl_md_create_frame_struct_cont(&metaFrameStruct_, roiCount) != PV_OK)
                 {
-                    LogCamError( __LINE__, "pl_md_create_frame_struct_cont() failed" );
+                    LogPvcamError( __LINE__, "pl_md_create_frame_struct_cont() failed" );
                     return DEVICE_OUT_OF_MEMORY;
                 }
             }
@@ -4065,7 +4085,7 @@ int Universal::resizeImageProcessingBuffers()
         {
             if (pl_md_create_frame_struct_cont(&metaFrameStruct_, roiCount) != PV_OK)
             {
-                LogCamError( __LINE__, "pl_md_create_frame_struct_cont() failed" );
+                LogPvcamError( __LINE__, "pl_md_create_frame_struct_cont() failed" );
                 return DEVICE_OUT_OF_MEMORY;
             }
         }
@@ -4074,7 +4094,7 @@ int Universal::resizeImageProcessingBuffers()
     {
         if (pl_md_release_frame_struct(metaFrameStruct_) != PV_OK)
         {
-            LogCamError( __LINE__, "pl_md_release_frame_struct() failed" );
+            LogPvcamError( __LINE__, "pl_md_release_frame_struct() failed" );
             return DEVICE_ERR;
         }
         metaFrameStruct_ = NULL;
@@ -4082,9 +4102,9 @@ int Universal::resizeImageProcessingBuffers()
 #endif
 
     // In case of RGB acquisition we need yet another buffer for demosaicing
-    if (acqCfgNew_.ColorProcessingEnabled)
+    if (acqCfgCur_.ColorProcessingEnabled)
     {
-        const PvRoi& roi = acqCfgNew_.Roi;
+        const PvRoi& roi = acqCfgCur_.Rois.ImpliedRoi();
         if (rgbImgBuf_)
         {
             // Reallocate the rgb image buffer only if really needed
@@ -4117,7 +4137,7 @@ int Universal::acquireFrameSeq()
     if (pl_exp_start_seq(hPVCAM_, singleFrameBufRaw_) != PV_OK)
     {
         const int16 pvErr = pl_error_code();
-        nRet = LogCamError(__LINE__, "pl_exp_start_seq() FAILED", pvErr);
+        nRet = LogPvcamError(__LINE__, "pl_exp_start_seq() FAILED", pvErr);
     }
     g_pvcamLock.Unlock();
 
@@ -4191,13 +4211,13 @@ int Universal::waitForFrameSeqPolling(const MM::MMTime& timeout)
     {
         // Abort the acquisition (ignore error if abort fails, just log it)
         if (!pl_exp_abort(hPVCAM_, CCS_HALT))
-            LogCamError(__LINE__, "waitForFrameSeqPolling(): pl_exp_abort() failed");
+            LogPvcamError(__LINE__, "waitForFrameSeqPolling(): pl_exp_abort() failed");
         if (pvRet == FALSE)
-            return LogCamError(__LINE__, "waitForFrameSeqPolling(): pl_exp_check_cont_status() failed.", pvErr);
+            return LogPvcamError(__LINE__, "waitForFrameSeqPolling(): pl_exp_check_cont_status() failed.", pvErr);
         if (pvStatus == READOUT_FAILED)
-            return LogMMError(__LINE__, ERR_FRAME_READOUT_FAILED, "waitForFrameSeqPolling(): pvStatus == READOUT_FAILED");
+            return LogAdapterError(ERR_FRAME_READOUT_FAILED, __LINE__, "waitForFrameSeqPolling(): pvStatus == READOUT_FAILED");
         if (timeElapsed > timeout)
-            return LogMMError(__LINE__, ERR_OPERATION_TIMED_OUT, "waitForFrameSeqPolling(): timeElapsed > timeout");
+            return LogAdapterError(ERR_OPERATION_TIMED_OUT, __LINE__, "waitForFrameSeqPolling(): timeElapsed > timeout");
     }
     return DEVICE_ERR;
 }
@@ -4212,10 +4232,10 @@ int Universal::waitForFrameSeqCallbacks(const MM::MMTime& timeout)
         {
             // If abort fails log the error but do not report it back
             const int16 pvErr = pl_error_code();
-            LogCamError(__LINE__, "pl_exp_abort() failed", pvErr);
+            LogPvcamError(__LINE__, "pl_exp_abort() failed", pvErr);
         }
         g_pvcamLock.Unlock();
-        return LogMMError(ERR_OPERATION_TIMED_OUT, __LINE__, "Readout has timed out");
+        return LogAdapterError(ERR_OPERATION_TIMED_OUT, __LINE__, "Readout has timed out");
     }
     else
     {
@@ -4263,7 +4283,7 @@ int Universal::waitForFrameConPolling(const MM::MMTime& timeout)
 
     if (bStop)
     {
-        LogMessage( "waitForFrameConPolling(): Stop called - breaking the loop", true);
+        LogAdapterMessage( "waitForFrameConPolling(): Stop called - breaking the loop", true);
         return DEVICE_ERR;
     }
     if (pvRet == TRUE && timeElapsed < timeout && pvStatus != READOUT_FAILED)
@@ -4277,13 +4297,13 @@ int Universal::waitForFrameConPolling(const MM::MMTime& timeout)
     {
         // Abort the acquisition (ignore error if abort fails, just log it)
         if (!pl_exp_abort(hPVCAM_, CCS_HALT))
-            LogCamError(__LINE__, "waitForFrameConPolling(): pl_exp_abort() failed");
+            LogPvcamError(__LINE__, "waitForFrameConPolling(): pl_exp_abort() failed");
         if (pvRet == FALSE)
-            return LogCamError(__LINE__, "waitForFrameConPolling(): pl_exp_check_cont_status() failed.", pvErr);
+            return LogPvcamError(__LINE__, "waitForFrameConPolling(): pl_exp_check_cont_status() failed.", pvErr);
         if (pvStatus == READOUT_FAILED)
-            return LogMMError(__LINE__, ERR_FRAME_READOUT_FAILED, "waitForFrameConPolling(): pvStatus == READOUT_FAILED");
+            return LogAdapterError(ERR_FRAME_READOUT_FAILED, __LINE__, "waitForFrameConPolling(): pvStatus == READOUT_FAILED");
         if (timeElapsed > timeout)
-            return LogMMError(__LINE__, ERR_OPERATION_TIMED_OUT, "waitForFrameConPolling(): timeElapsed > timeout");
+            return LogAdapterError(ERR_OPERATION_TIMED_OUT, __LINE__, "waitForFrameConPolling(): timeElapsed > timeout");
     }
     return DEVICE_ERR;
 }
@@ -4302,7 +4322,7 @@ int Universal::postProcessSingleFrame(unsigned char** pOutBuf, unsigned char* pI
 #endif
         if (pl_md_frame_decode(metaFrameStruct_, pInBuf, (uns32)inBufSz) != PV_OK)
         {
-            LogCamError(__LINE__, "Unable to decode the metadata-enabled frame");
+            LogPvcamError(__LINE__, "Unable to decode the metadata-enabled frame");
             return ERR_BUFFER_PROCESSING_FAILED;
         }
 #if _DEBUG
@@ -4316,9 +4336,18 @@ int Universal::postProcessSingleFrame(unsigned char** pOutBuf, unsigned char* pI
         if (acqCfgCur_.RoiCount > 1)
         {
             // If there are more ROIs we need to black-fill...
-            const PvRoi& roi = acqCfgCur_.Roi;
-            const uns16 offX = metaFrameStruct_->impliedRoi.s1 - roi.SensorRgnX();
-            const uns16 offY = metaFrameStruct_->impliedRoi.p1 - roi.SensorRgnY();
+            const PvRoi& roi = acqCfgCur_.Rois.ImpliedRoi();
+            
+            const uns16 bx = acqCfgCur_.Rois.BinX();
+            const uns16 by = acqCfgCur_.Rois.BinY();
+            // HACK! When binning is applied the PVCAM (3.1.9.1) does not reflect that
+            // in the implied ROI (it keeps reporting binning 1). The recompose function
+            // then fails. So we simply "fix" it ourselves.
+            metaFrameStruct_->impliedRoi.sbin = bx;
+            metaFrameStruct_->impliedRoi.pbin = by;
+            // HACK-END
+            uns16 offX = 0;
+            uns16 offY = 0;
             const uns16 recW = roi.ImageRgnWidth();
             const uns16 recH = roi.ImageRgnHeight();
             // If we are running centroids we should blackfill the destination frame
@@ -4326,11 +4355,17 @@ int Universal::postProcessSingleFrame(unsigned char** pOutBuf, unsigned char* pI
             // may contain centroids on different positions.
             if (acqCfgCur_.CentroidsEnabled)
             {
+                // With centroids we also need to shift the ROis to their sensor
+                // positions (beause with centroids we use full frame for display, not
+                // the implied ROI that can change with every frame)
+                offX = metaFrameStruct_->impliedRoi.s1 - roi.SensorRgnX();
+                offY = metaFrameStruct_->impliedRoi.p1 - roi.SensorRgnY();
+
                 memset(metaBlackFilledBuf_, 0, metaBlackFilledBufSz_);
             }
             if (pl_md_frame_recompose(metaBlackFilledBuf_, offX, offY, recW, recH, metaFrameStruct_) != PV_OK)
             {
-                LogCamError(__LINE__, "Unable to recompose the metadata-enabled frame");
+                LogPvcamError(__LINE__, "Unable to recompose the metadata-enabled frame");
                 return ERR_BUFFER_PROCESSING_FAILED;
             }
             else
@@ -4365,80 +4400,84 @@ int Universal::postProcessSingleFrame(unsigned char** pOutBuf, unsigned char* pI
     return DEVICE_OK;
 }
 
+int Universal::abortAcquisitionInternal()
+{
+    START_METHOD("Universal::abortAcquisitionInternal");
+    int nRet = DEVICE_OK;
+
+    // removed redundant calls to pl_exp_stop_cont &
+    //  pl_exp_finish_seq because they get called automatically when the thread exits.
+    if(isAcquiring_)
+    {
+        if (acqCfgCur_.CircBufEnabled)
+        {
+            if (acqCfgCur_.CallbacksEnabled)
+            {
+                g_pvcamLock.Lock();
+                if (!pl_exp_stop_cont( hPVCAM_, CCS_CLEAR ))
+                {
+                    nRet = DEVICE_ERR;
+                    LogPvcamError( __LINE__, "pl_exp_stop_cont() failed" );
+                }
+                g_pvcamLock.Unlock();
+                sequenceModeReady_ = false;
+                // Inform the core that the acquisition has finished
+                // (this also closes the shutter if used)
+                GetCoreCallback()->AcqFinished(this, nRet);
+            }
+            else
+            {
+                pollingThd_->setStop(true);
+                pollingThd_->wait();
+            }
+        }
+        else
+        {
+            acqThd_->Pause();
+        }
+        isAcquiring_ = false;
+        eofEvent_.Set();
+    }
+    return nRet;
+}
+
 #ifdef PVCAM_SMART_STREAMING_SUPPORTED
-int Universal::sendSmartStreamingToCamera()
+int Universal::sendSmartStreamingToCamera(const std::vector<double>& exposures, int exposureRes)
 {
     START_METHOD("Universal::SendSmartStreamingToCamera");
 
     int nRet = DEVICE_OK;
-    double greatestSmartExp;
-    uns16 expRes = EXP_RES_ONE_MILLISEC;
 
-    // If the exposure is smaller than 60 milliseconds (MM works in milliseconds but uses float type)
-    // we switch the camera to microseconds so user can type 59.5 and we send 59500 to PVCAM.
+    const size_t expCount = exposures.size();
 
-    // find the greatest SMART streaming exposure so a decision can be made whether to use 
-    // microsecond or milisecond exposure resolution
-    if (prmSmartStreamingEnabled_->Current() == TRUE)
-    {
-        greatestSmartExp = smartStreamValuesDouble_[0];
-        for (int i = 1; i < smartStreamEntries_; i++)
-        {
-            if (smartStreamValuesDouble_[i] > greatestSmartExp)
-            {
-                greatestSmartExp = smartStreamValuesDouble_[i];
-            }
-        } 
+    // the SMART streaming exposure values sent to cameras are uns32 while internally we need
+    // to be working with doubles
+    // allocate and populate regular smart_stream_type structure with values received from the UI
+    smart_stream_type smartStreamInts = prmSmartStreamingValues_->Current();
+    smartStreamInts.entries = static_cast<uns16>(expCount);
 
-        // the SMART streaming exposure values sent to cameras are uns32 while internally we need
-        // to be working with doubles
-        // allocate and populate regular smart_stream_type structure with values received from the UI
-        smart_stream_type smartStreamInts = prmSmartStreamingValues_->Current();
-        smartStreamInts.entries = smartStreamEntries_;
+    // We need to propertly fill the PVCAM S.M.A.R.T streaming structure, we keep the
+    // exposure values in an array of doubles and milliseconds, however the PVCAM structure
+    // needs to be filled based on current exposure resolution selection.
+    const double mult = (exposureRes == EXP_RES_ONE_MICROSEC) ? 1000.0 : 1.0;
+    for (size_t i = 0; i < expCount; i++)
+        smartStreamInts.params[i] = (uns32)(exposures[i] * mult);
 
-        // if all exposures are shorter than 60ms and camera supports microsecond resolution
-        // just convert doubles to uns32 exposures and send values to camera in microseconds
-        if (greatestSmartExp < 60000 && microsecResSupported_)
-        {
-            expRes = EXP_RES_ONE_MICROSEC;
-            for (int i = 0; i < smartStreamEntries_; i++)
-            {
-                smartStreamInts.params[i] = (uns32)(smartStreamValuesDouble_[i]);
-            }
-        }
-        // if either one exposure is longer than 60ms or microsecond resolution is not supported
-        // convert the exposures to miliseconds and uns32
-        // in this case all exposures shorter than 1ms will be reduced to 0ms
-        else
-        {
-            expRes = EXP_RES_ONE_MILLISEC;
-            for (int i = 0; i < smartStreamEntries_; i++)
-            {
-                smartStreamInts.params[i] = (uns32)(smartStreamValuesDouble_[i] / 1000.0);
-            }
+    g_pvcamLock.Lock();
+    // Send the SMART streaming structure to camera
+    nRet = prmSmartStreamingValues_->Set(smartStreamInts);
+    if (nRet != DEVICE_OK)
+        return nRet;
+    nRet = prmSmartStreamingValues_->Apply();
+    if (nRet != DEVICE_OK)
+        return nRet;
+    g_pvcamLock.Unlock();
 
-        }
-        g_pvcamLock.Lock();
-
-        // send the SMART streaming structure to camera
-        prmSmartStreamingValues_->Set(smartStreamInts);
-        prmSmartStreamingValues_->Apply();
-
-        // If the PARAM_EXP_RES_INDEX is not available, we use the exposure number as it is.
-        if ( prmExpResIndex_->IsAvailable() )
-        {
-            nRet = prmExpResIndex_->Set( expRes );
-            if (nRet == DEVICE_OK)
-                nRet = prmExpResIndex_->Apply();
-        }
-        g_pvcamLock.Unlock();
-    }
-
-    return 0;
+    return nRet;
 }
 #endif
 
-int Universal::getPvcamExposureSetupConfig(int16& pvExposeOutMode, uns32& pvExposureValue)
+int Universal::getPvcamExposureSetupConfig(int16& pvExposureMode, double inputExposureMs, uns32& pvExposureValue)
 {
     int nRet = DEVICE_OK;
 
@@ -4451,34 +4490,14 @@ int Universal::getPvcamExposureSetupConfig(int16& pvExposeOutMode, uns32& pvExpo
         eposeOutModeValue = (int16)prmExposeOutMode_->Current();
     }
 
-    pvExposeOutMode = (trigModeValue | eposeOutModeValue);
+    pvExposureMode = (trigModeValue | eposeOutModeValue);
 
     // Prepare the exposure value
 
-    uns16 expRes = EXP_RES_ONE_MILLISEC;
-
-    // If the exposure is smaller than 60 milliseconds (MM works in milliseconds but uses float type)
-    // we switch the camera to microseconds so user can type 59.5 and we send 59500 to PVCAM.
-    if (exposure_ < 60 && microsecResSupported_)
-    {
-        expRes = EXP_RES_ONE_MICROSEC;
-        pvExposureValue = (uns32)(1000*exposure_);
-    }
+    if (acqCfgCur_.ExposureRes == EXP_RES_ONE_MICROSEC)
+        pvExposureValue = (uns32)(1000 * inputExposureMs);
     else
-    {
-        expRes = EXP_RES_ONE_MILLISEC;
-        pvExposureValue = (uns32)exposure_;
-    }
-
-    g_pvcamLock.Lock();
-    // If the PARAM_EXP_RES_INDEX is not available, we use the exposure number as it is.
-    if ( prmExpResIndex_->IsAvailable() )
-    {
-        nRet = prmExpResIndex_->Set( expRes );
-        if (nRet == DEVICE_OK)
-            nRet = prmExpResIndex_->Apply();
-    }
-    g_pvcamLock.Unlock();
+        pvExposureValue = (uns32)inputExposureMs;
 
     return nRet;
 }
@@ -4504,18 +4523,18 @@ int Universal::refreshPostProcValues()
         ppIndx = (int16)PostProc_[i].GetppIndex();
         if (!pl_set_param(hPVCAM_, PARAM_PP_INDEX, &ppIndx))
         {
-            LogCamError(__LINE__, "pl_set_param PARAM_PP_INDEX"); 
+            LogPvcamError(__LINE__, "pl_set_param PARAM_PP_INDEX"); 
             return DEVICE_ERR;
         }
         ppIndx = (int16)PostProc_[i].GetpropIndex();
         if (!pl_set_param(hPVCAM_, PARAM_PP_PARAM_INDEX, &ppIndx))
         {
-            LogCamError(__LINE__, "pl_set_param PARAM_PP_PARAM_INDEX"); 
+            LogPvcamError(__LINE__, "pl_set_param PARAM_PP_PARAM_INDEX"); 
             return DEVICE_ERR;
         }
         if (!pl_get_param(hPVCAM_, PARAM_PP_PARAM, ATTR_CURRENT, &ppValue))
         {
-            LogCamError(__LINE__, "pl_get_param PARAM_PP_PARAM ATTR_CURRENT"); 
+            LogPvcamError(__LINE__, "pl_get_param PARAM_PP_PARAM ATTR_CURRENT"); 
             return DEVICE_ERR;
         }
         PostProc_[i].SetcurValue(ppValue);
@@ -4554,11 +4573,12 @@ int Universal::portChanged()
     // Set the allowed readout rates
     SetAllowedValues( g_ReadoutRate, spdChoices );
 
-    // Set the current speed to first avalable rate, this will cause the speedChanged() call.
+    // Set the current speed to the default rate, this will cause the speedChanged() call.
     // TODO: This needs to be revisited. When SetProperty is called on a read-only property
     // the handler is not called at all. If we have port options that have just single speed
     // and thus we make that property read-only this call will not work properly.
-    SetProperty( g_ReadoutRate, spdChoices[0].c_str()); 
+    const int16 defSpdIdx = camSpdTable_[curPort][0].portDefaultSpdIdx;
+    SetProperty( g_ReadoutRate, spdChoices[defSpdIdx].c_str()); 
 
     return DEVICE_OK;
 }
@@ -4592,12 +4612,18 @@ int Universal::speedChanged()
     return DEVICE_OK;
 }
 
-int Universal::postExpSetupInit()
+int Universal::postExpSetupInit(unsigned int frameSize)
 {
     int nRet = DEVICE_OK;
 
     if (prmTempSetpoint_->IsAvailable())
         nRet = prmTempSetpoint_->Update();
+
+    // This will update the CircularBufferFrameCount property in the Device/Property
+    // browser. We need to call this because we need to reflect the change in circBufFrameCount_.
+    // Also, if we are in manual buffer size mode and binning/ROI is changed during live the
+    // circular buffer limits may get adjusted and this needs to be reflected as well.
+    nRet = updateCircBufRange(frameSize);
 
     return nRet;
 }
@@ -4606,7 +4632,7 @@ int Universal::updateCircBufRange(unsigned int frameSize)
 {
     int nRet = DEVICE_OK;
 
-    if (circBufSizeAuto_)
+    if (acqCfgCur_.CircBufSizeAuto)
     {
         // In auto mode the property is read-only and has no limits. There is a little catch though,
         // to disable the "slider" when the property is made read-only we need to call 
@@ -4637,7 +4663,9 @@ int Universal::updateCircBufRange(unsigned int frameSize)
     // Unfortunately we need to call the OnPropert*ies*Changed because this seems to
     // be the only way that correctly updates the property range in the UI. The 
     // OnPropert*y*Changed updates the value only.
-    nRet = OnPropertiesChanged();
+    // LW: 2016-06-20 Commenting out because the call to OnPropertiesChanged now causes
+    //     an immediate call of StartSequenceAcquisition() -> results in hang of Live mode.
+    //nRet = GetCoreCallback()->OnPropertiesChanged(this);
 
     return nRet;
 }
@@ -4677,18 +4705,20 @@ int Universal::selectDebayerAlgMask(int xRoiPos, int yRoiPos, int32 pvcamColorMo
 
 int Universal::applyAcqConfig()
 {
+    int nRet = DEVICE_OK;
+
     // If we are capturing do not do anything, this function will be called
-    // again once the acquisition is restarted
+    // again once the acquisition is restarted.
     if (isAcquiring_)
     {
         return DEVICE_OK;
     }
 
-    int nRet = DEVICE_OK;
-
     // If we are not acquiring, we can configure the camera right away
 
     // Some changes will require reallocation of our buffers
+    // TODO: Better name would be "setupRequired" or similar, setting this flag will
+    // force the call to pl_exp_setup() functions
     bool bufferResizeRequired = false;
     // This function is called on several places. After a change in property and
     // upon starting acquisition. If we are not running live mode the configuration
@@ -4697,6 +4727,11 @@ int Universal::applyAcqConfig()
     // TODO: Write custom comparer for AcqConfig class and use (cfgNew != cfgOld)
     bool configChanged = false;
 
+    // Please note the order of calls in this function may be important. For example,
+    // when Centroiding is enabled the Metadata needs to be enabled automatically
+    // right after that which may additionally affect buffers. If S.M.A.R.T streaming
+    // values change we may need to change the exposure resolution etc.
+
     // Enabling or disabling color mode requires buffer reallocation
     if (acqCfgNew_.ColorProcessingEnabled != acqCfgCur_.ColorProcessingEnabled)
     {
@@ -4704,8 +4739,8 @@ int Universal::applyAcqConfig()
         bufferResizeRequired = true;
     }
 
-    const PvRoi& newRoi = acqCfgNew_.Roi;
-    const PvRoi& curRoi = acqCfgCur_.Roi;
+    PvRoiCollection& newRois = acqCfgNew_.Rois;
+    const PvRoiCollection& curRois = acqCfgCur_.Rois;
 
     // NOTE: Some features do not work when turned on together. E.g. Centroids may
     // not work with Binning, or something else may not work when ROI is selected.
@@ -4715,27 +4750,41 @@ int Universal::applyAcqConfig()
     // ROI that was drawn on a different image. Or drawn on an image acquired with 1x1 binning but
     // the current configuration uses 2x2 binning. We cannot easily detect that because uM
     // won't tell us what binning we should use when applying ROI.
-    if (!newRoi.IsValid(camSerSize_, camParSize_))
+    if (!newRois.IsValid(camSerSize_, camParSize_))
     {
         acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
-        LogCamError( __LINE__, "Universal::applyAcqConfig() ROI definition is invalid for current camera configuration" );
-        return ERR_ROI_DEFINITION_INVALID;
+        return LogAdapterError( ERR_ROI_DEFINITION_INVALID, __LINE__,
+            "Universal::applyAcqConfig() ROI definition is invalid for current camera configuration" );
     }
 
     // VALIDATE Centroids (PrimeEnhance), so far it works with 1x1 binning only
-    if (acqCfgNew_.CentroidsEnabled && acqCfgNew_.Roi.BinX() > 1 && acqCfgNew_.Roi.BinY() > 1)
+    if (acqCfgNew_.CentroidsEnabled && acqCfgNew_.Rois.BinX() > 1 && acqCfgNew_.Rois.BinY() > 1)
     {
         acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
-        LogCamError( __LINE__, "Universal::applyAcqConfig() Centroids (PrimeEnhance) is not supported with binning." );
-        return ERR_BINNING_INVALID;
+        return LogAdapterError( ERR_BINNING_INVALID, __LINE__,
+            "Universal::applyAcqConfig() Centroids (PrimeEnhance) is not supported with binning." );
+    }
+    // Centroids also do not work with user defined Multiple ROIs
+    if (acqCfgNew_.CentroidsEnabled && acqCfgNew_.Rois.Count() > 1)
+    {
+        acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
+        return LogAdapterError( ERR_ROI_DEFINITION_INVALID, __LINE__,
+            "Universal::applyAcqConfig() Centroids (PrimeEnhance) is not supported with multiple ROIs." );
     }
 
     // Change in ROI or binning requires buffer reallocation
-    if (!newRoi.Equals(curRoi))
+    if (!newRois.Equals(curRois))
     {
+        // If binning has changed adjust the coordinates to the binning factor
+        newRois.AdjustCoords();
         configChanged = true;
         bufferResizeRequired = true;
     }
+
+    // Multi-ROIs require metadata
+    if (acqCfgNew_.Rois.Count() > 1)
+        if (!acqCfgCur_.FrameMetadataEnabled)
+            acqCfgNew_.FrameMetadataEnabled = true;
 
     // Centroids require frame metadata so we need to check this first and
     // enable the metadata automatically if needed, the setting will be sent
@@ -4768,8 +4817,6 @@ int Universal::applyAcqConfig()
             acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
             return nRet; // Error logged in SetAndApply()
         }
-        // Update the ROI count
-        acqCfgNew_.RoiCount = acqCfgNew_.CentroidsEnabled ? acqCfgNew_.CentroidsCount : 1;
     }
     if (acqCfgNew_.CentroidsRadius != acqCfgCur_.CentroidsRadius)
     {
@@ -4790,10 +4837,13 @@ int Universal::applyAcqConfig()
             acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
             return nRet; // Error logged in SetAndApply()
         }
-        // Update the generic ROI count so the md_frame structure can be reinitialized if needed
-        if (acqCfgCur_.CentroidsEnabled)
-            acqCfgNew_.RoiCount = acqCfgNew_.CentroidsCount;
     }
+
+    // Update the "output" ROI count so the md_frame structure can be reinitialized if needed
+    if (acqCfgNew_.CentroidsEnabled)
+        acqCfgNew_.RoiCount = acqCfgNew_.CentroidsCount;
+    else
+        acqCfgNew_.RoiCount = static_cast<int>(acqCfgNew_.Rois.Count());
 
     // Fan speed setpoint
     if (acqCfgNew_.FanSpeedSetpoint != acqCfgCur_.FanSpeedSetpoint)
@@ -4810,14 +4860,17 @@ int Universal::applyAcqConfig()
     // Debayering algorithm selection
     if (acqCfgNew_.DebayerAlgMaskAuto && acqCfgNew_.ColorProcessingEnabled)
     {
-        const int xPos = acqCfgNew_.Roi.SensorRgnX();
-        const int yPos = acqCfgNew_.Roi.SensorRgnY();
+        // TODO: We need to have per-roi mask selection :(
+        const int xPos = acqCfgNew_.Rois.At(0).SensorRgnX();
+        const int yPos = acqCfgNew_.Rois.At(0).SensorRgnY();
         acqCfgNew_.DebayerAlgMask = selectDebayerAlgMask(xPos, yPos, camCurrentSpeed_.colorMask);
         // Config changes only if the current and previous mask actually differs (see below)
     }
     if (acqCfgNew_.DebayerAlgMask != acqCfgCur_.DebayerAlgMask)
     {
         configChanged = true;
+        // TODO: With Multi-ROI we need to debayer each ROI individually and with individual mask,
+        //       remove this and set the OrderIndex for every ROI.
         debayer_.SetOrderIndex(acqCfgNew_.DebayerAlgMask);
     }
     if (acqCfgNew_.DebayerAlgInterpolation != acqCfgCur_.DebayerAlgInterpolation)
@@ -4873,6 +4926,11 @@ int Universal::applyAcqConfig()
         configChanged = true;
         bufferResizeRequired = true;
     }
+    if (acqCfgNew_.CircBufSizeAuto != acqCfgCur_.CircBufSizeAuto)
+    {
+        configChanged = true;
+        bufferResizeRequired = true;
+    }
 
     if (acqCfgNew_.CallbacksEnabled != acqCfgCur_.CallbacksEnabled)
     {
@@ -4884,7 +4942,7 @@ int Universal::applyAcqConfig()
             {
                 acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
                 const int16 pvErr = pl_error_code();
-                return LogCamError(__LINE__, "pl_cam_register_callback_ex3() failed", pvErr);
+                return LogPvcamError(__LINE__, "pl_cam_register_callback_ex3() failed", pvErr);
             }
         }
         else
@@ -4893,9 +4951,103 @@ int Universal::applyAcqConfig()
             {
                 acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
                 const int16 pvErr = pl_error_code();
-                return LogCamError(__LINE__, "pl_cam_deregister_callback() failed", pvErr);
+                return LogPvcamError(__LINE__, "pl_cam_deregister_callback() failed", pvErr);
             }
         }
+    }
+
+    // Change in exposure only means to reconfigure the acquisition
+    if (acqCfgNew_.ExposureMs != acqCfgCur_.ExposureMs)
+    {
+        configChanged = true;
+        bufferResizeRequired = true;
+    }
+    // The exposure time value that will be used to decide which exposure
+    // resolution to set, this depends on S.M.A.R.T streaming as well.
+    double exposureTimeDecisiveMs = acqCfgNew_.ExposureMs;
+
+    // S.M.A.R.T streaming is quite tricky. We want to have it active only for Live mode because
+    // it does not work for single snaps. For single snaps (a sequence of one frame) we want to
+    // use the original exposure time so we need to temporarily suppress the S.M.A.R.T streaming.
+
+    bool doReconfigureSmart = false;
+    if (prmSmartStreamingEnabled_->IsAvailable())
+    {
+        if (acqCfgNew_.AcquisitionType != acqCfgCur_.AcquisitionType)
+            doReconfigureSmart = true;
+        if (acqCfgNew_.SmartStreamingEnabled != acqCfgCur_.SmartStreamingEnabled)
+            doReconfigureSmart = true;
+        if (acqCfgNew_.SmartStreamingExposures != acqCfgCur_.SmartStreamingExposures)
+            doReconfigureSmart = true;
+    }
+    if (doReconfigureSmart)
+    {
+        // Check if we have correct amount of exposures
+        if (acqCfgNew_.SmartStreamingExposures.size() > prmSmartStreamingValues_->Max().entries)
+        {
+            acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
+            return LogAdapterError( DEVICE_CAN_NOT_SET_PROPERTY,
+                __LINE__, "Universal::applyAcqConfig() Too many S.M.A.R.T exposures entered" );
+        }
+        // S.M.A.R.T streaming is active in Live mode only
+        acqCfgNew_.SmartStreamingActive =
+            (acqCfgNew_.AcquisitionType == AcqType_Live) && (acqCfgNew_.SmartStreamingEnabled);
+        // Enable or disable the S.M.A.R.T streaming in PVCAM
+        nRet = prmSmartStreamingEnabled_->SetAndApply(acqCfgNew_.SmartStreamingActive ? TRUE : FALSE);
+        if (nRet != DEVICE_OK)
+        {
+            acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
+            return nRet; // Error logged in SetAndApply()
+        }
+    }
+
+
+    // If the S.M.A.R.T streaming is active we need to check the exposure values
+    // and possibly switch the camera exposure resolution accordingly (see below)
+    if (acqCfgNew_.SmartStreamingActive)
+        exposureTimeDecisiveMs = *std::max_element(
+            acqCfgNew_.SmartStreamingExposures.begin(), acqCfgNew_.SmartStreamingExposures.end());
+
+    // Now we know for sure wheter S.M.A.R.T is going to be used or not, so we have
+    // the exposure time that should be used to select the right exposure resolution
+
+    // If the exposure is smaller than 'microsecResMax' milliseconds (MM works in milliseconds but uses float type)
+    // we switch the camera to microseconds so user can type 59.5 and we send 59500 to PVCAM.
+    if (exposureTimeDecisiveMs < (microsecResMax_/1000.0) && microsecResSupported_)
+        acqCfgNew_.ExposureRes = EXP_RES_ONE_MICROSEC;
+    else
+        acqCfgNew_.ExposureRes = EXP_RES_ONE_MILLISEC;
+
+    // The exposure resolution is switched automatically and depends on two features that are handled above:
+    // The generic exposure value or the highest S.M.A.R.T streaming value. Because of that the order
+    // of the calls matters and we need to switch the exposure resolution here, once we know whether
+    // we are running S.M.A.R.T, what are the S.M.A.R.T exposures or whether we run simple acquisition.
+    if (acqCfgNew_.ExposureRes != acqCfgCur_.ExposureRes)
+    {
+        // If the PARAM_EXP_RES_INDEX is not available, we use the exposure number as it is.
+        if (prmExpResIndex_->IsAvailable())
+        {
+            nRet = prmExpResIndex_->SetAndApply(static_cast<uns16>(acqCfgNew_.ExposureRes));
+            if (nRet != DEVICE_OK)
+            {
+                acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
+                return nRet; // Error logged in SetAndApply()
+            }
+        }
+    }
+
+    // Finally finish S.M.A.R.T reconfiguration because at this point we know the exposure
+    // resolution that is important for S.M.A.R.T streaming exposure values conversion
+    if (doReconfigureSmart)
+    {
+        nRet = sendSmartStreamingToCamera(acqCfgNew_.SmartStreamingExposures, acqCfgNew_.ExposureRes);
+        if (nRet != DEVICE_OK)
+        {
+            acqCfgNew_ = acqCfgCur_; // New settings not accepted, reset it back to previous state
+            return nRet; // Error logged in SetAndApply()
+        }
+        configChanged = true;
+        bufferResizeRequired = true;
     }
 
     // The new properties have been applied. Since we now reinitialize the buffers
@@ -4913,15 +5065,13 @@ int Universal::applyAcqConfig()
         // See postExpSetupInit()
         // We prepare the acquisition based on previous configuration. If user was snapping single
         // frames, we prepare the single frame, if user was running live, we prepare live.
-        if (sequenceModeReady_)
+        if (acqCfgNew_.AcquisitionType == AcqType_Live)
         {
-            sequenceModeReady_ = false;
             nRet = resizeImageBufferContinuous();
             sequenceModeReady_ = true;
         }
         else
         {
-            singleFrameModeReady_ = false;
             nRet = resizeImageBufferSingle();
             singleFrameModeReady_ = true;
         }
@@ -4934,6 +5084,9 @@ int Universal::applyAcqConfig()
     }
 
     // Update the Device/Property browser UI
+    // LW: 2016-06-20 We may need to comment this out as well because the call to
+    // OnPropertiesChanged often causes an immediate call to StartSequenceAcquisition()
+    // which in turn results in hang of Live mode. (happens in uM 2.0, not 1.4)
     if (configChanged)
         nRet = this->GetCoreCallback()->OnPropertiesChanged(this);
 

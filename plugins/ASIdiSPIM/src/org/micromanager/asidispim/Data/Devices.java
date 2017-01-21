@@ -53,6 +53,9 @@ import org.micromanager.asidispim.api.ASIdiSPIMException;
  */
 public class Devices {
 
+   // TODO would like to be able to use static methods on devices (e.g. to see whether a camera supports a particular triggering mode)
+   //   but it isn't possible as presently implemented  => consider other architectures
+   
    private final List<String> loadedDevices_;
    private final Prefs prefs_;
    private final CMMCore core_;
@@ -93,6 +96,7 @@ public class Devices {
       PLOGIC,
       TIGERCOMM,
       UPPERHDRIVE, // horizontal drive for oSPIM head
+      SHUTTERLOWER,  // shutter to be used with lower camera
       // ASGALVOA, ASGALVOB,
       // when adding new devices update Devices constructor, 
       // getDefaultDeviceData(), and Libraries enum
@@ -119,6 +123,7 @@ public class Devices {
       HAMCAM("HamamatsuHam"), 
       PCOCAM("PCO_Camera"), 
       ANDORCAM("AndorSDK3"),
+      PVCAM("PVCAM"),
       DEMOCAM("DemoCamera"),
       UTILITIES("Utilities"),
       UNKNOWN("Unknown") // if the device is valid but not one we know about
@@ -719,6 +724,8 @@ public class Devices {
          return new DeviceData(key, "PLogic Card", Sides.NONE, true);
       case TIGERCOMM:
          return new DeviceData(key, "TigerComm", Sides.NONE, false);
+      case SHUTTERLOWER:
+         return new DeviceData(key, "Lower Shutter", Sides.NONE, true);
       case CORE: // special case
          d_new = new DeviceData(key, "Core", Sides.NONE, false);
          d_new.mmDevice = "Core";
@@ -768,6 +775,7 @@ public class Devices {
       deviceInfo_.put(Keys.LOWERZDRIVE, getDefaultDeviceData(Keys.LOWERZDRIVE));
       deviceInfo_.put(Keys.UPPERZDRIVE, getDefaultDeviceData(Keys.UPPERZDRIVE));
       deviceInfo_.put(Keys.PLOGIC, getDefaultDeviceData(Keys.PLOGIC));
+      deviceInfo_.put(Keys.SHUTTERLOWER, getDefaultDeviceData(Keys.SHUTTERLOWER));
       deviceInfo_.put(Keys.TIGERCOMM, getDefaultDeviceData(Keys.TIGERCOMM));
       deviceInfo_.put(Keys.UPPERHDRIVE, getDefaultDeviceData(Keys.UPPERHDRIVE));
       // deviceInfo_.put(Keys.SOURCE_SPIM,  getDefaultDeviceData(Keys.SOURCE_SPIM));

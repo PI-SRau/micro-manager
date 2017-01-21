@@ -133,6 +133,7 @@ public:
    int OnScanSlowStopPosition (MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnScanNumLines         (MM::PropertyBase* pProp, MM::ActionType eAct);
    int OnScanSettlingTime     (MM::PropertyBase* pProp, MM::ActionType eAct);
+   int OnScanOvershootDistance (MM::PropertyBase* pProp, MM::ActionType eAct);
 
 private:
    double unitMultX_;
@@ -146,7 +147,7 @@ private:
 
    // private helper functions
    int OnSaveJoystickSettings();
-   double getMaxSpeed(string axisLetter, ASIHub *hub_);
+   double getMaxSpeed(string axisLetter);
 };
 
 #endif //_ASIXYStage_H_

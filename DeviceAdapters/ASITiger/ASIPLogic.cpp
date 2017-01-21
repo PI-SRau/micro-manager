@@ -22,10 +22,6 @@
 // BASED ON:      ASIStage.cpp and others
 //
 
-#ifdef WIN32
-#define snprintf _snprintf 
-#pragma warning(disable: 4355)
-#endif
 
 #include "ASIPLogic.h"
 #include "ASITiger.h"
@@ -180,6 +176,9 @@ int CPLogic::Initialize()
       AddAllowedValue(g_SetCardPresetPropertyName, g_PresetCode24, 24);
       AddAllowedValue(g_SetCardPresetPropertyName, g_PresetCode25, 25);
       AddAllowedValue(g_SetCardPresetPropertyName, g_PresetCode26, 26);
+   }
+   if (FirmwareVersionAtLeast(3.17)) {
+      AddAllowedValue(g_SetCardPresetPropertyName, g_PresetCode27, 27);
    }
    UpdateProperty(g_SetCardPresetPropertyName);
 

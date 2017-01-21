@@ -25,11 +25,6 @@
 //
 //
 
-#ifdef WIN32
-#define snprintf _snprintf 
-#pragma warning(disable: 4355)
-#endif
-
 #include "ASITiger.h"
 #include "ASITigerComm.h"
 #include "ASIXYStage.h"
@@ -83,6 +78,8 @@ MODULE_API MM::Device* CreateDevice(const char* deviceName)
       return new CFSlider(deviceName);
    else if (deviceStr.compare(0, strlen(g_TurretDeviceName), (string)g_TurretDeviceName) == 0)
       return new CTurret(deviceName);
+   else if (deviceStr.compare(0, strlen(g_PortSwitchDeviceName), (string)g_PortSwitchDeviceName) == 0)
+      return new CPortSwitch(deviceName);
    else if (deviceStr.compare(0, strlen(g_FWheelDeviceName), (string)g_FWheelDeviceName) == 0)
       return new CFWheel(deviceName);
    else if (deviceStr.compare(0, strlen(g_ScannerDeviceName), (string)g_ScannerDeviceName) == 0)

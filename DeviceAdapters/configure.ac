@@ -281,7 +281,7 @@ fi
 
 
 # MessagePack
-MM_ARG_WITH_OPTIONAL_LIB([MSGPACK], [msgpack], [MSGPACK])
+MM_ARG_WITH_OPTIONAL_LIB([MessagePack], [msgpack], [MSGPACK])
 AS_IF([test "x$want_msgpack" != xno],
 [
    MM_LIB_MSGPACK([$MSGPACK_PREFIX],
@@ -494,6 +494,7 @@ m4_define([device_adapter_dirs], [m4_strip([
    Vortran
    XCite120PC_Exacte
    XCiteLed
+   XCiteXT600
    XLight
    Xcite
    Yokogawa

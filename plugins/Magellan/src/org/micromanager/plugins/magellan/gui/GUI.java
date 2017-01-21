@@ -87,6 +87,7 @@ import javax.swing.JTextField;
 import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
 import org.micromanager.plugins.magellan.acq.AcqDurationEstimator;
+import org.micromanager.plugins.magellan.acq.MultiResMultipageTiffStorage;
 import org.micromanager.plugins.magellan.main.Magellan;
 import org.micromanager.plugins.magellan.misc.GlobalSettings;
 import org.micromanager.plugins.magellan.misc.JavaUtils;
@@ -237,6 +238,22 @@ public class GUI extends javax.swing.JFrame {
                      ij.plugin.BrowserLauncher.openURL("https://micro-manager.org/wiki/MicroMagellan");
                   } catch (IOException ex) {
                      Log.log("couldn't open User guide link");
+                  }
+               }
+            }).start();
+         }
+      });
+       //add link to citation
+       citeLink_.addMouseListener(new MouseAdapter() {
+         @Override
+         public void mousePressed(MouseEvent e) {
+            new Thread(new Runnable() {
+               @Override
+               public void run() {
+                  try {            
+                     ij.plugin.BrowserLauncher.openURL("http://www.nature.com/nmeth/journal/v13/n10/full/nmeth.3991.html");
+                  } catch (IOException ex) {
+                     Log.log("couldn't open citation link");
                   }
                }
             }).start();
@@ -513,6 +530,7 @@ public class GUI extends javax.swing.JFrame {
             settings.footprint_ = getFootprintObject(footprint2DComboBox_.getSelectedIndex());
         } else if (checkBox3D_.isSelected()) {
             settings.zStep_ = (Double) zStepSpinner_.getValue();
+            settings.channelsAtEverySlice_ = acqOrderCombo_.getSelectedIndex() == 0;
             if (simpleZStackRadioButton_.isSelected()) {
                 settings.spaceMode_ = FixedAreaAcquisitionSettings.SIMPLE_Z_STACK;
                 settings.footprint_ = getFootprintObject(simpleZStackFootprintCombo_.getSelectedIndex());
@@ -578,6 +596,7 @@ public class GUI extends javax.swing.JFrame {
         timeIntervalSpinner_.setValue(settings.timePointInterval_);
         timeIntevalUnitCombo_.setSelectedIndex(settings.timeIntervalUnit_);
         //space           
+        acqOrderCombo_.setSelectedIndex(settings.channelsAtEverySlice_ ? 0 : 1);
         checkBox2D_.setSelected(settings.spaceMode_ == FixedAreaAcquisitionSettings.REGION_2D);
         checkBox3D_.setSelected(settings.spaceMode_ == FixedAreaAcquisitionSettings.SIMPLE_Z_STACK
                 || settings.spaceMode_ == FixedAreaAcquisitionSettings.VOLUME_BETWEEN_SURFACES_Z_STACK
@@ -832,6 +851,8 @@ public class GUI extends javax.swing.JFrame {
       acqTileOverlapLabel_ = new javax.swing.JLabel();
       acqOverlapPercentSpinner_ = new javax.swing.JSpinner();
       tileOverlapPercentLabel_ = new javax.swing.JLabel();
+      acqOrderCombo_ = new javax.swing.JComboBox();
+      acqOrderLabel_ = new javax.swing.JLabel();
       ChannelsTab_ = new javax.swing.JPanel();
       jScrollPane1 = new javax.swing.JScrollPane();
       channelsTable_ = new javax.swing.JTable();
@@ -902,6 +923,7 @@ public class GUI extends javax.swing.JFrame {
       helpButton_ = new javax.swing.JButton();
       userGuideLink_ = new javax.swing.JLabel();
       estDurationLabel_ = new javax.swing.JLabel();
+      citeLink_ = new javax.swing.JLabel();
 
       jLabel11.setText("jLabel11");
 
@@ -1822,6 +1844,15 @@ public class GUI extends javax.swing.JFrame {
       tileOverlapPercentLabel_.setFont(new java.awt.Font("Tahoma", 0, 14)); // NOI18N
       tileOverlapPercentLabel_.setText("%");
 
+      acqOrderCombo_.setModel(new javax.swing.DefaultComboBoxModel(new String[] { "Channels at each Z slice", "Z stacks for each channel" }));
+      acqOrderCombo_.addActionListener(new java.awt.event.ActionListener() {
+         public void actionPerformed(java.awt.event.ActionEvent evt) {
+            acqOrderCombo_ActionPerformed(evt);
+         }
+      });
+
+      acqOrderLabel_.setText("Order:");
+
       javax.swing.GroupLayout spaceTab_Layout = new javax.swing.GroupLayout(spaceTab_);
       spaceTab_.setLayout(spaceTab_Layout);
       spaceTab_Layout.setHorizontalGroup(
@@ -1831,16 +1862,20 @@ public class GUI extends javax.swing.JFrame {
             .addGroup(spaceTab_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
                .addGroup(spaceTab_Layout.createSequentialGroup()
                   .addComponent(checkBox3D_)
-                  .addGap(40, 40, 40)
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                   .addComponent(zStepLabel_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                   .addComponent(zStepSpinner_, javax.swing.GroupLayout.PREFERRED_SIZE, 77, javax.swing.GroupLayout.PREFERRED_SIZE)
-                  .addGap(37, 37, 37)
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
                   .addComponent(acqTileOverlapLabel_)
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                  .addComponent(acqOverlapPercentSpinner_, javax.swing.GroupLayout.PREFERRED_SIZE, 65, javax.swing.GroupLayout.PREFERRED_SIZE)
-                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
-                  .addComponent(tileOverlapPercentLabel_))
+                  .addComponent(acqOverlapPercentSpinner_, javax.swing.GroupLayout.PREFERRED_SIZE, 58, javax.swing.GroupLayout.PREFERRED_SIZE)
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                  .addComponent(tileOverlapPercentLabel_)
+                  .addGap(18, 18, 18)
+                  .addComponent(acqOrderLabel_)
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
+                  .addComponent(acqOrderCombo_, javax.swing.GroupLayout.PREFERRED_SIZE, 207, javax.swing.GroupLayout.PREFERRED_SIZE))
                .addGroup(spaceTab_Layout.createSequentialGroup()
                   .addGroup(spaceTab_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
                      .addComponent(simpleZPanel_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
@@ -1865,7 +1900,9 @@ public class GUI extends javax.swing.JFrame {
                   .addComponent(zStepLabel_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
                   .addComponent(acqTileOverlapLabel_)
                   .addComponent(acqOverlapPercentSpinner_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
-                  .addComponent(tileOverlapPercentLabel_)))
+                  .addComponent(tileOverlapPercentLabel_)
+                  .addComponent(acqOrderCombo_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)
+                  .addComponent(acqOrderLabel_)))
             .addGroup(spaceTab_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
                .addGroup(spaceTab_Layout.createSequentialGroup()
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
@@ -2458,10 +2495,14 @@ public class GUI extends javax.swing.JFrame {
 
       estDurationLabel_.setText("Estimted Duration: ");
 
+      citeLink_.setFont(new java.awt.Font("Tahoma", 0, 14)); // NOI18N
+      citeLink_.setText("<html><a href=\\\"http://www.nature.com/nmeth/journal/v13/n10/full/nmeth.3991.html\\\">Cite Micro-Magellan</a></html>");
+
       javax.swing.GroupLayout splitPaneBottomPanel_Layout = new javax.swing.GroupLayout(splitPaneBottomPanel_);
       splitPaneBottomPanel_.setLayout(splitPaneBottomPanel_Layout);
       splitPaneBottomPanel_Layout.setHorizontalGroup(
          splitPaneBottomPanel_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
+         .addComponent(acqTabbedPane_)
          .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
             .addGroup(splitPaneBottomPanel_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
                .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
@@ -2507,25 +2548,25 @@ public class GUI extends javax.swing.JFrame {
                   .addGap(337, 337, 337)
                   .addComponent(jLabel1))
                .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
-                  .addGap(153, 153, 153)
-                  .addComponent(createdByHenryLabel_))
-               .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
                   .addGap(121, 121, 121)
                   .addComponent(configPropsButton_, javax.swing.GroupLayout.PREFERRED_SIZE, 182, javax.swing.GroupLayout.PREFERRED_SIZE)
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                   .addComponent(jButton1)
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
                   .addComponent(helpButton_)
-                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                  .addComponent(userGuideLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
-               .addGroup(javax.swing.GroupLayout.Alignment.TRAILING, splitPaneBottomPanel_Layout.createSequentialGroup()
-                  .addContainerGap()
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                  .addComponent(citeLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
+               .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
+                  .addGap(250, 250, 250)
                   .addComponent(runAcqButton_)
                   .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-                  .addComponent(estDurationLabel_)
-                  .addGap(341, 341, 341)))
+                  .addComponent(estDurationLabel_))
+               .addGroup(splitPaneBottomPanel_Layout.createSequentialGroup()
+                  .addGap(30, 30, 30)
+                  .addComponent(createdByHenryLabel_)
+                  .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.UNRELATED)
+                  .addComponent(userGuideLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE)))
             .addContainerGap(javax.swing.GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE))
-         .addComponent(acqTabbedPane_)
       );
       splitPaneBottomPanel_Layout.setVerticalGroup(
          splitPaneBottomPanel_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.LEADING)
@@ -2559,7 +2600,7 @@ public class GUI extends javax.swing.JFrame {
             .addGap(1, 1, 1)
             .addComponent(jLabel1)
             .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-            .addComponent(acqTabbedPane_)
+            .addComponent(acqTabbedPane_, javax.swing.GroupLayout.DEFAULT_SIZE, 415, Short.MAX_VALUE)
             .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
             .addGroup(splitPaneBottomPanel_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
                .addComponent(estDurationLabel_)
@@ -2569,9 +2610,11 @@ public class GUI extends javax.swing.JFrame {
                .addComponent(configPropsButton_)
                .addComponent(jButton1)
                .addComponent(helpButton_)
-               .addComponent(userGuideLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
+               .addComponent(citeLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
             .addPreferredGap(javax.swing.LayoutStyle.ComponentPlacement.RELATED)
-            .addComponent(createdByHenryLabel_)
+            .addGroup(splitPaneBottomPanel_Layout.createParallelGroup(javax.swing.GroupLayout.Alignment.BASELINE)
+               .addComponent(createdByHenryLabel_)
+               .addComponent(userGuideLink_, javax.swing.GroupLayout.PREFERRED_SIZE, javax.swing.GroupLayout.DEFAULT_SIZE, javax.swing.GroupLayout.PREFERRED_SIZE))
             .addGap(9, 9, 9))
       );
 
@@ -3011,9 +3054,15 @@ public class GUI extends javax.swing.JFrame {
       acquisitionSettingsChanged();
    }//GEN-LAST:event_withinDistanceFromFootprintCombo_ActionPerformed
 
+   private void acqOrderCombo_ActionPerformed(java.awt.event.ActionEvent evt) {//GEN-FIRST:event_acqOrderCombo_ActionPerformed
+      acquisitionSettingsChanged();
+   }//GEN-LAST:event_acqOrderCombo_ActionPerformed
+
    // Variables declaration - do not modify//GEN-BEGIN:variables
    private javax.swing.JComboBox ChannelGroupCombo_;
    private javax.swing.JPanel ChannelsTab_;
+   private javax.swing.JComboBox acqOrderCombo_;
+   private javax.swing.JLabel acqOrderLabel_;
    private javax.swing.JSpinner acqOverlapPercentSpinner_;
    private javax.swing.JTabbedPane acqTabbedPane_;
    private javax.swing.JLabel acqTileOverlapLabel_;
@@ -3047,6 +3096,7 @@ public class GUI extends javax.swing.JFrame {
    private javax.swing.JTable channelsTable_;
    private javax.swing.JCheckBox checkBox2D_;
    private javax.swing.JCheckBox checkBox3D_;
+   private javax.swing.JLabel citeLink_;
    private javax.swing.JButton configPropsButton_;
    private javax.swing.JPanel controlPanelName_;
    private javax.swing.JTable covariantPairValuesTable_;

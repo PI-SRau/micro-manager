@@ -118,6 +118,7 @@ public class Properties {
       INPUT_MODE("InputMode"),
       PIEZO_MODE("PiezoMode"),
       SET_HOME_HERE("SetHomeToCurrentPosition"),
+      HOME_POSITION("HomePosition(mm)"),
       AUTO_SLEEP_DELAY("AutoSleepDelay(min)"),
       PLOGIC_MODE("PLogicMode"),
       PLOGIC_PRESET("SetCardPreset"),
@@ -140,7 +141,9 @@ public class Properties {
       STAGESCAN_SLOW_STOP("ScanSlowAxisStopPosition(mm)", false),
       STAGESCAN_SETTLING_TIME("ScanSettlingTime(ms)", false),
       STAGESCAN_MOTOR_SPEED("MotorSpeedX-S(mm/s)", false),
+      STAGESCAN_MAX_MOTOR_SPEED("MotorSpeedMaximumX(mm/s)", false),
       STAGESCAN_MOTOR_ACCEL("AccelerationX-AC(ms)", false),
+      STAGESCAN_OVERSHOOT_DIST("ScanOvershootDistance(um)", false),
       BINNING("Binning"),
       TRIGGER_SOURCE("TRIGGER SOURCE"),   // for Hamamatsu
       TRIGGER_POLARITY("TriggerPolarity"),// for Hamamatsu
@@ -151,19 +154,22 @@ public class Properties {
       TRIGGER_MODE_PCO("Triggermode"),         // for PCO
       PIXEL_RATE("PixelRate"),                 // for PCO
       CAMERA_TYPE("CameraType"),               // for PCO
-      TRIGGER_MODE("TriggerMode"),             // for Andor Zyla
+      TRIGGER_MODE("TriggerMode"),             // for Andor Zyla, PVCAM
       CAMERA_NAME("CameraName"),               // for Andor Zyla
       PIXEL_READOUT_RATE("PixelReadoutRate"),  // for Andor Zyla
       ANDOR_OVERLAP("Overlap"),                // for Andor Zyla
       PIXEL_TYPE("PixelType"),            // for DemoCam
       CAMERA_SIZE_X("OnCameraCCDXSize"),  // for DemoCam
       CAMERA_SIZE_Y("OnCameraCCDYSize"),  // for DemoCam
+      CAMERA_X_DIMENSION("X-dimension"),  // for PVCAM
+      CAMERA_Y_DIMENSION("Y-dimension"),  // for PVCAM
       FIRMWARE_VERSION("FirmwareVersion"),
       CAMERA("Camera"),
       PLUGIN_POSITION_REFRESH_INTERVAL("PositionRefreshInterval(s)"),
       PLUGIN_NUM_SIDES("NumberOfSides"),
       PLUGIN_FIRST_SIDE("FirstSide"),
       PLUGIN_NUM_SLICES("NumSlices"),
+      PLUGIN_DELAY_BEFORE_SIDE("DelayBeforeSide"),
       PLUGIN_NUM_ACQUISITIONS("NumberOfAcquisitions"),
       PLUGIN_ACQUISITION_INTERVAL("AcquisitionPeriod"),
       PLUGIN_DIRECTORY_ROOT("DirectoryRoot"),
@@ -198,7 +204,8 @@ public class Properties {
       AUTOFOCUS_SCORING_ALGORITHM("AutofocusScoringAlgorithm"),
       PLUGIN_ACQUSITION_USE_AUTOFOCUS("UseAutofocusInAcquisition"),
       PLUGIN_CAMERA_MODE("CameraMode"),
-      PLUGIN_CAMERA_LIVE_EXPOSURE("CameraLiveExposureMs"),
+      PLUGIN_CAMERA_LIVE_EXPOSURE_FIRST("CameraLiveExposureMs_First"),  // used internally to save/restore live exposure time
+      PLUGIN_CAMERA_LIVE_EXPOSURE_SECOND("CameraLiveExposureMs_Second"),  // used internally to save/restore live exposure time
       PLUGIN_CAMERA_LIVE_SCAN("CameraLiveScanMs"),
       PREFS_ENABLE_POSITION_UPDATES("EnablePositionUpdates"),
       PREFS_AUTO_SHEET_WIDTH("AutomaticSheetWidth"),
@@ -225,7 +232,11 @@ public class Properties {
       PLUGIN_AUTOFOCUS_AUTOUPDATE_OFFSET("AutofocusAutoUpdateOffset"),
       PLUGIN_AUTOFOCUS_CHANNEL("AutofocusChannel"),
       PLUGIN_AUTOFOCUS_MINIMUMR2("AutofocusMinimumR2"),
-      PLUGIN_ADVANCED_CAMERA_EXPOSURE("AdvancedCameraExposure")
+      PLUGIN_ADVANCED_CAMERA_EXPOSURE("AdvancedCameraExposure"),
+      PLUGIN_DESKEW_FACTOR("DeskewFactor"),
+      PLUGIN_DESKEW_INVERT("DeskewInvert"),
+      PLUGIN_DESKEW_INTERPOLATE("DeskewInterpolate"),
+      PLUGIN_DESKEW_AUTO_TEST("DeskewAutoTest"),
       ;
       private final String text;
       private final boolean forceSet;
@@ -292,6 +303,8 @@ public class Properties {
       LEVEL_PCO("External Exp. Ctrl."),
       INTERNAL_ANDOR("Internal (Recommended for fast acquisitions)"),
       LEVEL_ANDOR("External Exposure"),
+      INTERNAL_TRIGGER("Internal Trigger"),
+      EDGE_TRIGGER("Edge Trigger"),
       POSITIVE("POSITIVE"),
       NEGATIVE("NEGATIVE"),
       SIXTEENBIT("16bit"),
